@@ -179,21 +179,39 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "issue_dependencies_blocked",
 ]);
 
+// Auth errors that signal a fleet-wide outage rather than a per-issue failure.
+// Issues with these codes must not be parked or reassigned — the adapter will
+// recover once credentials are restored, and the issue should resume in place.
+export const FLEET_GATED_CONTINUATION_ERROR_CODES = new Set<string>([
+  "claude_auth_required",
+  "acpx_auth_required",
+]);
+
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 
-type ContinuationRetryClassification = {
-  kind: "transient_infra" | "non_retryable" | "default";
+// How far back to look when deciding whether the fleet adapter is in an auth outage.
+const FLEET_GATED_OUTAGE_LOOKBACK_MS = 2 * 60 * 60 * 1000; // 2 hours
+// Deduplicate per-issue outage notices to at most one per this window.
+const FLEET_GATED_NOTICE_DEDUPE_WINDOW_MS = 4 * 60 * 60 * 1000; // 4 hours
+
+export type ContinuationRetryClassification = {
+  kind: "transient_infra" | "non_retryable" | "fleet_gated" | "default";
   maxAttempts: number;
   baseBackoffMs: number;
   errorCode: string | null;
 };
 
-function classifyContinuationFailure(latestRun: LatestIssueRun): ContinuationRetryClassification {
+export function classifyContinuationFailure(latestRun: LatestIssueRun): ContinuationRetryClassification {
   const errorCode = readNonEmptyString(latestRun?.errorCode);
   if (errorCode && NON_RETRYABLE_CONTINUATION_ERROR_CODES.has(errorCode)) {
     return { kind: "non_retryable", maxAttempts: 0, baseBackoffMs: 0, errorCode };
+  }
+  if (errorCode && FLEET_GATED_CONTINUATION_ERROR_CODES.has(errorCode)) {
+    // maxAttempts/baseBackoffMs are unused for fleet_gated — retry cadence is
+    // governed by the fleet-level auth check, not a per-issue attempt counter.
+    return { kind: "fleet_gated", maxAttempts: 0, baseBackoffMs: 0, errorCode };
   }
   if (errorCode && TRANSIENT_INFRA_CONTINUATION_ERROR_CODES.has(errorCode)) {
     return {
@@ -536,6 +554,73 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (latestFinishedAt === null) latestFinishedAt = row.finishedAt ?? null;
     }
     return { consecutive, latestFinishedAt };
+  }
+
+  // Returns true when ALL recent finished runs from agents of this adapter type failed
+  // with the given auth-error code, meaning the fleet is currently in an auth outage.
+  // A single successful run within the lookback window is enough to declare auth healthy.
+  async function isFleetAdapterInAuthOutage(
+    companyId: string,
+    agentId: string,
+    errorCode: string,
+  ): Promise<boolean> {
+    const agent = await getAgent(agentId);
+    if (!agent) return false;
+
+    const windowStart = new Date(Date.now() - FLEET_GATED_OUTAGE_LOOKBACK_MS);
+    const recentRuns = await db
+      .select({
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(agents.adapterType, agent.adapterType),
+          gte(heartbeatRuns.createdAt, windowStart),
+          inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out"]),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(100);
+
+    if (recentRuns.length === 0) return false;
+    const hasRecentSuccess = recentRuns.some((r) => r.status === "succeeded");
+    if (hasRecentSuccess) return false;
+    // Only an outage if we have at least one run with the auth error (not just generic failures).
+    return recentRuns.some((r) => r.errorCode === errorCode);
+  }
+
+  // Posts one outage notice per FLEET_GATED_NOTICE_DEDUPE_WINDOW_MS on the issue.
+  // Keeps the issue in its current status — does NOT park or reassign.
+  async function maybePostFleetAuthOutageNotice(issueId: string, errorCode: string) {
+    const marker = `fleet_auth_outage:${errorCode}`;
+    const windowStart = new Date(Date.now() - FLEET_GATED_NOTICE_DEDUPE_WINDOW_MS);
+    const hasRecentNotice = await db
+      .select({ id: issueComments.id, body: issueComments.body })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.authorType, "system"),
+          gte(issueComments.createdAt, windowStart),
+        ),
+      )
+      .then((rows) => rows.some((r) => (r.body ?? "").includes(marker)));
+
+    if (!hasRecentNotice) {
+      await issuesSvc.addComment(
+        issueId,
+        `Paperclip detected a fleet authentication outage (\`${errorCode}\`). ` +
+        "This issue is paused until adapter credentials are restored — it will resume automatically once auth succeeds. " +
+        "No intervention needed unless the outage persists.\n\n" +
+        `<!-- ${marker} -->`,
+        {},
+        { authorType: "system" },
+      );
+    }
   }
 
   async function hasActiveExecutionPath(companyId: string, issueId: string) {
@@ -2546,23 +2631,38 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         if (didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
-          const failureSummary = summarizeRunFailureForIssueComment(latestRun);
-          const updated = await escalateStrandedAssignedIssue({
-            issue,
-            previousStatus: "todo",
-            latestRun,
-            comment:
-              "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
-              `but it still has no live execution path.${failureSummary ?? ""} ` +
-              "Moving it to `blocked` so it is visible for intervention.",
-          });
-          if (updated) {
-            result.escalated += 1;
-            result.issueIds.push(issue.id);
+          const todoErrorCode = readNonEmptyString(latestRun?.errorCode);
+          if (todoErrorCode && FLEET_GATED_CONTINUATION_ERROR_CODES.has(todoErrorCode)) {
+            const inOutage = await isFleetAdapterInAuthOutage(
+              issue.companyId,
+              agentId,
+              todoErrorCode,
+            );
+            if (inOutage) {
+              await maybePostFleetAuthOutageNotice(issue.id, todoErrorCode);
+              result.skipped += 1;
+              continue;
+            }
+            // Auth appears restored — fall through to enqueueStrandedIssueRecovery below.
           } else {
-            result.skipped += 1;
+            const failureSummary = summarizeRunFailureForIssueComment(latestRun);
+            const updated = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: "todo",
+              latestRun,
+              comment:
+                "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
+                `but it still has no live execution path.${failureSummary ?? ""} ` +
+                "Moving it to `blocked` so it is visible for intervention.",
+            });
+            if (updated) {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
           }
-          continue;
         }
 
         if (await isInvocationBudgetBlocked(issue, agentId)) {
@@ -2684,7 +2784,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
+        if (classification.kind === "fleet_gated") {
+          // Do NOT park or reassign — the issue stays with its assignee and resumes
+          // automatically once the adapter's auth is restored.
+          const inOutage = await isFleetAdapterInAuthOutage(
+            issue.companyId,
+            agentId,
+            classification.errorCode!,
+          );
+          if (inOutage) {
+            await maybePostFleetAuthOutageNotice(issue.id, classification.errorCode!);
+            result.skipped += 1;
+            continue;
+          }
+          // Auth appears restored — fall through to enqueueStrandedIssueRecovery below.
+        }
+
+        if (classification.kind !== "fleet_gated" && didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
           const { consecutive, latestFinishedAt } = await summarizeRecentContinuationRetries(
             issue.companyId,
             issue.id,
