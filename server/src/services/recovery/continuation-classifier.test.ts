@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyContinuationFailure,
+  decideFleetAuthOutage,
   FLEET_GATED_CONTINUATION_ERROR_CODES,
   type ContinuationRetryClassification,
 } from "./service.js";
@@ -114,5 +115,61 @@ describe("classifyContinuationFailure", () => {
       const result = classifyContinuationFailure(makeRun("claude_transient_upstream"));
       expect(result.kind).not.toBe("fleet_gated");
     });
+  });
+});
+
+// ── decideFleetAuthOutage (ADR-004 call-site gate) ───────────────────────────
+// These are the negative and positive fixtures that prove the gate which decides
+// parking/escalation — not just the classifier that labels the error code.
+
+type RunSummary = { status: string; errorCode: string | null };
+
+describe("decideFleetAuthOutage", () => {
+  const CODE = "claude_auth_required";
+
+  it("returns false when no recent runs exist (>2h outage, no fleet signal)", () => {
+    expect(decideFleetAuthOutage([], CODE)).toBe(false);
+  });
+
+  // NEGATIVE FIXTURE (ADR-004): one healthy sibling run → fleet is not in outage.
+  // Post-patch, this path must escalate (not enqueue unboundedly).
+  it("returns false when any sibling succeeded — fleet healthy, per-agent credential issue", () => {
+    const runs: RunSummary[] = [
+      { status: "succeeded", errorCode: null },
+      { status: "failed", errorCode: CODE },
+    ];
+    expect(decideFleetAuthOutage(runs, CODE)).toBe(false);
+  });
+
+  it("returns false when runs failed with a different error (not an auth outage)", () => {
+    const runs: RunSummary[] = [
+      { status: "failed", errorCode: "adapter_failed" },
+      { status: "failed", errorCode: "timeout" },
+    ];
+    expect(decideFleetAuthOutage(runs, CODE)).toBe(false);
+  });
+
+  // POSITIVE FIXTURE: all runs failed with the auth error → outage.
+  it("returns true when all runs failed and at least one carried the auth error", () => {
+    const runs: RunSummary[] = [
+      { status: "failed", errorCode: CODE },
+      { status: "failed", errorCode: CODE },
+    ];
+    expect(decideFleetAuthOutage(runs, CODE)).toBe(true);
+  });
+
+  it("returns true with mixed auth-error and generic failures (no successes)", () => {
+    const runs: RunSummary[] = [
+      { status: "failed", errorCode: CODE },
+      { status: "timed_out", errorCode: null },
+    ];
+    expect(decideFleetAuthOutage(runs, CODE)).toBe(true);
+  });
+
+  it("is error-code-specific: acpx_auth_required does not satisfy claude_auth_required gate", () => {
+    const runs: RunSummary[] = [
+      { status: "failed", errorCode: "acpx_auth_required" },
+    ];
+    expect(decideFleetAuthOutage(runs, CODE)).toBe(false);
   });
 });
