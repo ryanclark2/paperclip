@@ -121,3 +121,70 @@ describe("extractClaudeRetryNotBefore", () => {
     ).toBeNull();
   });
 });
+
+// ALM-6309: the 2026-09-02 session-limit blackout retried every few seconds for
+// 5h20m because neither phrase list contained "session limit", so no reset time
+// was ever extracted from the message that printed one.
+describe("ALM-6309 session-limit reset extraction", () => {
+  const SESSION_LIMIT = "Claude run failed: subtype=success: You've hit your session limit · resets 2:50am (America/Los_Angeles)";
+  const BARE_LIMIT = "Claude run failed: subtype=success: You've hit your limit · resets 9:50pm (America/Los_Angeles)";
+  const USAGE_LIMIT = "Claude run failed: usage limit reached · resets 7:50am (America/Los_Angeles)";
+
+  it("classifies all three observed quota variants as transient", () => {
+    for (const message of [SESSION_LIMIT, BARE_LIMIT, USAGE_LIMIT]) {
+      expect(isClaudeTransientUpstreamError({ errorMessage: message })).toBe(true);
+    }
+  });
+
+  it("extracts the printed reset for 'hit your session limit'", () => {
+    const now = new Date("2026-09-02T09:00:00.000Z");
+    const extracted = extractClaudeRetryNotBefore({ errorMessage: SESSION_LIMIT }, now);
+    // 2:50am America/Los_Angeles (PDT, UTC-7) == 09:50Z, still ahead of `now`.
+    expect(extracted?.toISOString()).toBe("2026-09-02T09:50:00.000Z");
+  });
+
+  it("extracts the printed reset for 'hit your limit'", () => {
+    const now = new Date("2026-09-02T09:00:00.000Z");
+    const extracted = extractClaudeRetryNotBefore({ errorMessage: BARE_LIMIT }, now);
+    expect(extracted?.toISOString()).toBe("2026-09-03T04:50:00.000Z");
+  });
+
+  it("extracts the printed reset for 'usage limit reached'", () => {
+    const now = new Date("2026-09-02T09:00:00.000Z");
+    const extracted = extractClaudeRetryNotBefore({ errorMessage: USAGE_LIMIT }, now);
+    expect(extracted?.toISOString()).toBe("2026-09-02T14:50:00.000Z");
+  });
+
+  it("prefers the machine-readable rate_limit_event resetsAt over the printed clock time", () => {
+    // Verbatim shape from run 258c9b56-a73c-49bd-aea2-aaefff6e5233 stdout, with the
+    // prose deliberately disagreeing so the assertion pins which source is used.
+    // resetsAt 1788360600 == 2026-09-02T14:50:00Z; the prose alone would give 06:50Z.
+    const stdout = [
+      '{"type":"system","subtype":"init","session_id":"50412f56"}',
+      '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1788360600,"rateLimitType":"five_hour","overageStatus":"rejected"}}',
+      '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"You\'ve hit your session limit · resets 11:50pm (America/Los_Angeles)"}',
+    ].join("\n");
+    const extracted = extractClaudeRetryNotBefore(
+      { stdout, errorMessage: "Claude run failed: subtype=success: You've hit your session limit · resets 11:50pm (America/Los_Angeles)" },
+      new Date("2026-09-02T14:32:00.000Z"),
+    );
+    expect(extracted?.toISOString()).toBe("2026-09-02T14:50:00.000Z");
+  });
+
+  it("extracts the reset from rate_limit_event alone when no reset prose is present", () => {
+    const stdout = [
+      '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1788360600,"rateLimitType":"five_hour"}}',
+      '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"You\'ve hit your session limit"}',
+    ].join("\n");
+    const extracted = extractClaudeRetryNotBefore({ stdout }, new Date("2026-09-02T14:32:00.000Z"));
+    expect(extracted?.toISOString()).toBe("2026-09-02T14:50:00.000Z");
+  });
+
+  it("ignores a rate_limit_event that was not a rejection", () => {
+    const stdout =
+      '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1788360600,"rateLimitType":"five_hour"}}';
+    expect(
+      extractClaudeRetryNotBefore({ stdout }, new Date("2026-09-02T14:32:00.000Z")),
+    ).toBeNull();
+  });
+});

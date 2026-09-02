@@ -10,9 +10,9 @@ const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
 
 const CLAUDE_TRANSIENT_UPSTREAM_RE =
-  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached)/i;
+  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|session\s+limit|hit\s+your\s+limit)/i;
 const CLAUDE_EXTRA_USAGE_RESET_RE =
-  /(?:out\s+of\s+extra\s+usage|extra\s+usage|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
+  /(?:out\s+of\s+extra\s+usage|extra\s+usage|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached|session\s+limit|hit\s+your\s+limit)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
 
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
@@ -352,6 +352,35 @@ function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: 
   return retryAt;
 }
 
+// The Claude CLI emits a machine-readable `rate_limit_event` alongside the prose
+// refusal, carrying the exact reset instant as a Unix timestamp. Prefer it over the
+// printed clock time: it needs no timezone inference and no phrase matching.
+function extractClaudeRateLimitResetsAt(haystack: string, now: Date): Date | null {
+  let latest: Date | null = null;
+  for (const line of haystack.split(/\r?\n/)) {
+    if (!line.includes("rate_limit_event")) continue;
+    const event = parseJson(line.trim());
+    if (!event) continue;
+    if (asString(event.type, "") !== "rate_limit_event") continue;
+
+    const info = parseObject(event.rate_limit_info);
+    // Only a rejection means the run was actually blocked until the reset; an
+    // informational "allowed" event would push the retry out for no reason.
+    const rejected = [asString(info.status, ""), asString(info.overageStatus, "")]
+      .some((value) => /reject/i.test(value));
+    if (!rejected) continue;
+
+    const resetsAtRaw = asNumber(info.resetsAt, 0);
+    if (!Number.isFinite(resetsAtRaw) || resetsAtRaw <= 0) continue;
+    // Claude prints seconds; tolerate a millisecond stamp from a future CLI.
+    const resetsAt = new Date(resetsAtRaw > 1e11 ? resetsAtRaw : resetsAtRaw * 1000);
+    if (Number.isNaN(resetsAt.getTime())) continue;
+    if (resetsAt.getTime() <= now.getTime()) continue;
+    if (!latest || resetsAt.getTime() > latest.getTime()) latest = resetsAt;
+  }
+  return latest;
+}
+
 export function extractClaudeRetryNotBefore(
   input: {
     parsed?: Record<string, unknown> | null;
@@ -362,6 +391,8 @@ export function extractClaudeRetryNotBefore(
   now = new Date(),
 ): Date | null {
   const haystack = buildClaudeTransientHaystack(input);
+  const structuredResetsAt = extractClaudeRateLimitResetsAt(haystack, now);
+  if (structuredResetsAt) return structuredResetsAt;
   const match = haystack.match(CLAUDE_EXTRA_USAGE_RESET_RE);
   if (!match) return null;
   return parseClaudeResetClockTime(match[1] ?? "", now, match[2]);

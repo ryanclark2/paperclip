@@ -99,7 +99,15 @@ type RecoveryWakeup = (
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
-  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState"
+  | "id"
+  | "agentId"
+  | "status"
+  | "error"
+  | "errorCode"
+  | "contextSnapshot"
+  | "livenessState"
+  | "resultJson"
+  | "finishedAt"
 > | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
 
@@ -191,6 +199,37 @@ export const FLEET_GATED_CONTINUATION_ERROR_CODES = new Set<string>([
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
+// ALM-6309: a provider quota refusal lasts hours, so continuation recovery must not
+// re-wake the issue on a seconds/one-minute cadence while the limit is still in force.
+const CONTINUATION_RECOVERY_QUOTA_FLOOR_MS = 5 * 60_000;
+
+// Error families that mean "the provider refused us until a reset", not "this issue
+// is broken". Their retry cadence is governed by the printed reset when we have one.
+const QUOTA_FAMILY_CONTINUATION_ERROR_CODES = new Set<string>([
+  "claude_transient_upstream",
+  "codex_transient_upstream",
+]);
+
+function isQuotaFamilyContinuationRun(latestRun: LatestIssueRun) {
+  if (!latestRun) return false;
+  const errorCode = readNonEmptyString(latestRun.errorCode);
+  if (errorCode && QUOTA_FAMILY_CONTINUATION_ERROR_CODES.has(errorCode)) return true;
+  return readNonEmptyString(parseObject(latestRun.resultJson).errorFamily) === "transient_upstream";
+}
+
+// The adapter persists the exact moment the provider limit lifts. Honour it here as
+// well as in the bounded transient retry path, otherwise every failed run immediately
+// manufactures another one and the issue spins for the whole outage.
+function readContinuationRetryNotBefore(latestRun: LatestIssueRun) {
+  if (!latestRun) return null;
+  const resultJson = parseObject(latestRun.resultJson);
+  const value = resultJson.retryNotBefore ?? resultJson.transientRetryNotBefore;
+  if (!(typeof value === "string" || typeof value === "number" || value instanceof Date)) {
+    return null;
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
 
 // How far back to look when deciding whether the fleet adapter is in an auth outage.
 const FLEET_GATED_OUTAGE_LOOKBACK_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -508,6 +547,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         errorCode: heartbeatRuns.errorCode,
         contextSnapshot: heartbeatRuns.contextSnapshot,
         livenessState: heartbeatRuns.livenessState,
+        resultJson: heartbeatRuns.resultJson,
+        finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -2843,6 +2884,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             result.skipped += 1;
           }
           continue;
+        }
+
+        // ALM-6309: gate on the provider's own reset time, and floor the cadence for
+        // quota refusals, before the attempt-counter logic below. That logic only fires
+        // when the previous run was itself a continuation retry, so the alternating
+        // transient_failure_retry -> continuation_recovery path had no backoff at all.
+        const quotaRetryNotBefore = readContinuationRetryNotBefore(latestRun);
+        if (quotaRetryNotBefore && Date.now() < quotaRetryNotBefore.getTime()) {
+          result.skipped += 1;
+          continue;
+        }
+        if (isQuotaFamilyContinuationRun(latestRun) && latestRun?.finishedAt) {
+          const elapsedSinceQuotaFailure = Date.now() - new Date(latestRun.finishedAt).getTime();
+          if (elapsedSinceQuotaFailure < CONTINUATION_RECOVERY_QUOTA_FLOOR_MS) {
+            result.skipped += 1;
+            continue;
+          }
         }
 
         if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {

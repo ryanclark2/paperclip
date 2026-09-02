@@ -564,6 +564,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     livenessState?: "completed" | "advanced" | "plan_only" | "empty_response" | "blocked" | "failed" | "needs_followup" | null;
     runErrorCode?: string | null;
     runError?: string | null;
+    // ALM-6309: lets a test inject the adapter's quota recovery contract and age the run.
+    runResultJson?: Record<string, unknown> | null;
+    runFinishedAt?: Date;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -628,8 +631,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ...(input.runSource ? { source: input.runSource } : {}),
       },
       startedAt: now,
-      finishedAt: new Date("2026-03-19T00:05:00.000Z"),
-      updatedAt: new Date("2026-03-19T00:05:00.000Z"),
+      finishedAt: input.runFinishedAt ?? new Date("2026-03-19T00:05:00.000Z"),
+      updatedAt: input.runFinishedAt ?? new Date("2026-03-19T00:05:00.000Z"),
+      ...(input.runResultJson ? { resultJson: input.runResultJson } : {}),
       errorCode: input.runStatus === "succeeded"
         ? null
         : ("runErrorCode" in input ? input.runErrorCode : "process_lost"),
@@ -2443,6 +2447,76 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     if (retryRun) {
       await waitForRunToSettle(heartbeat, retryRun.id);
     }
+  });
+
+  // ── ALM-6309 ──────────────────────────────────────────────────────────────
+  // On 2026-09-02 a Claude session-limit blackout produced ~942 retries in 5h20m.
+  // The bounded transient path already honoured `retryNotBefore`, but continuation
+  // recovery requeued with no backoff at all whenever the previous run was not
+  // itself a continuation retry — which is every alternate run in the storm.
+  it("does not requeue continuation before the provider's printed quota reset", async () => {
+    const resetsAt = new Date(Date.now() + 2 * 60 * 60 * 1000);
+    const { issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "claude_transient_upstream",
+      runError: "Claude run failed: subtype=success: You've hit your session limit \u00b7 resets 2:50am (America/Los_Angeles)",
+      runResultJson: {
+        errorFamily: "transient_upstream",
+        retryNotBefore: resetsAt.toISOString(),
+        transientRetryNotBefore: resetsAt.toISOString(),
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+  });
+
+  it("requeues continuation once the printed quota reset has passed", async () => {
+    const resetsAt = new Date(Date.now() - 60 * 1000);
+    const { issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "claude_transient_upstream",
+      runError: "Claude run failed: subtype=success: You've hit your session limit \u00b7 resets 2:50am (America/Los_Angeles)",
+      runResultJson: {
+        errorFamily: "transient_upstream",
+        retryNotBefore: resetsAt.toISOString(),
+        transientRetryNotBefore: resetsAt.toISOString(),
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(1);
+    expect(result.issueIds).toContain(issueId);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, (await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.companyId));
+    const retryRun = runs.find((row) => (row.contextSnapshot as Record<string, unknown>)?.retryReason === "issue_continuation_needed");
+    if (retryRun) {
+      await waitForRunToSettle(heartbeat, retryRun.id);
+    }
+  });
+
+  // When the reset time cannot be parsed, a quota failure still must not spin at
+  // seconds cadence: the floor is minutes.
+  it("floors continuation requeue for an unparsed quota failure at minutes, not seconds", async () => {
+    const { issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "claude_transient_upstream",
+      runError: "Claude run failed: subtype=success: You've hit your session limit",
+      runFinishedAt: new Date(Date.now() - 7_000),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
   });
 
   it("does not continue seeded in-progress work that has no run linkage", async () => {
