@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parsePiJsonl, isPiUnknownSessionError } from "./parse.js";
+import { detectPiAuthRequired, parsePiJsonl, isPiUnknownSessionError } from "./parse.js";
 
 describe("parsePiJsonl", () => {
   it("parses agent lifecycle and messages", () => {
@@ -269,5 +269,107 @@ describe("isPiUnknownSessionError", () => {
     expect(isPiUnknownSessionError("", "no session available")).toBe(true);
     expect(isPiUnknownSessionError("all good", "")).toBe(false);
     expect(isPiUnknownSessionError("working fine", "no errors")).toBe(false);
+  });
+});
+
+describe("parsePiJsonl provider-error reporting (ALM-6012)", () => {
+  // Verbatim shape from GeminiEng run e6d3b6db-b759-4164-b68d-697b2df30523: the Gemini
+  // Code Assist credential lost its entitlement, pi reported the failure on the assistant
+  // message, and still exited 0.
+  const LICENSE_403 =
+    "Cloud Code Assist API error (403): You do not have a valid license of this product. " +
+    "Please contact your administrator to request a license. (#3501)";
+
+  const turnEndError = (errorMessage: string | undefined) =>
+    JSON.stringify({
+      type: "turn_end",
+      message: {
+        role: "assistant",
+        content: [],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+        ...(errorMessage === undefined ? {} : { errorMessage }),
+        stopReason: "error",
+      },
+    });
+
+  it("reports a turn_end stopReason=error as a parse error", () => {
+    const parsed = parsePiJsonl(turnEndError(LICENSE_403));
+    expect(parsed.errors).toEqual([LICENSE_403]);
+  });
+
+  it("reports an agent_end stopReason=error when no turn_end carried it", () => {
+    const stdout = JSON.stringify({
+      type: "agent_end",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "wake payload" }] },
+        { role: "assistant", content: [], stopReason: "error", errorMessage: LICENSE_403 },
+      ],
+    });
+
+    const parsed = parsePiJsonl(stdout);
+    expect(parsed.errors).toEqual([LICENSE_403]);
+  });
+
+  it("does not double-report when turn_end and agent_end carry the same failure", () => {
+    const stdout = [
+      turnEndError(LICENSE_403),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: LICENSE_403 }],
+      }),
+    ].join("\n");
+
+    expect(parsePiJsonl(stdout).errors).toEqual([LICENSE_403]);
+  });
+
+  it("still reports an error when stopReason=error carries no errorMessage", () => {
+    const parsed = parsePiJsonl(turnEndError(undefined));
+    expect(parsed.errors).toHaveLength(1);
+    expect(parsed.errors[0]).toMatch(/stopReason=error/);
+  });
+
+  // Control: a healthy turn must stay clean, or every successful pi run would fail.
+  it("reports no error for a normal completed turn", () => {
+    const stdout = [
+      JSON.stringify({ type: "agent_start" }),
+      JSON.stringify({
+        type: "turn_end",
+        message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "end_turn" },
+      }),
+      JSON.stringify({ type: "agent_end", messages: [] }),
+    ].join("\n");
+
+    expect(parsePiJsonl(stdout).errors).toEqual([]);
+  });
+});
+
+describe("detectPiAuthRequired", () => {
+  const LICENSE_403 =
+    "Cloud Code Assist API error (403): You do not have a valid license of this product. " +
+    "Please contact your administrator to request a license. (#3501)";
+
+  it("flags the Cloud Code Assist entitlement 403", () => {
+    expect(detectPiAuthRequired({ errors: [LICENSE_403], stderr: "" }).requiresAuth).toBe(true);
+  });
+
+  it("flags a stderr credential failure", () => {
+    expect(
+      detectPiAuthRequired({ errors: [], stderr: "Error: 401 Unauthorized — please re-authenticate" })
+        .requiresAuth,
+    ).toBe(true);
+  });
+
+  it("does not flag an ordinary tool failure", () => {
+    expect(
+      detectPiAuthRequired({ errors: ["ENOENT: no such file or directory, open '/tmp/x'"], stderr: "" })
+        .requiresAuth,
+    ).toBe(false);
+  });
+
+  it("does not flag a quota/rate-limit failure as an auth failure", () => {
+    expect(
+      detectPiAuthRequired({ errors: ["429 Too Many Requests: quota exceeded, retry in 60s"], stderr: "" })
+        .requiresAuth,
+    ).toBe(false);
   });
 });

@@ -36,6 +36,16 @@ describe("classifyContinuationFailure", () => {
       expect(result.maxAttempts).toBe(0);
     });
 
+    // ALM-6012: a pi_local credential/entitlement 403 must NOT park or reassign the issue.
+    // The "covers every code in the set" loop below cannot pin this — it is satisfied by any
+    // superset, so removing pi_auth_required would leave it green. This names the code.
+    it("classifies pi_auth_required as fleet_gated", () => {
+      const result = classifyContinuationFailure(makeRun("pi_auth_required"));
+      expect(result.kind).toBe("fleet_gated");
+      expect(result.errorCode).toBe("pi_auth_required");
+      expect(result.maxAttempts).toBe(0);
+    });
+
     it("covers every code in FLEET_GATED_CONTINUATION_ERROR_CODES", () => {
       for (const code of FLEET_GATED_CONTINUATION_ERROR_CODES) {
         const result = classifyContinuationFailure(makeRun(code));

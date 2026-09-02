@@ -28,6 +28,23 @@ function extractTextContent(content: string | Array<{ type: string; text?: strin
     .join("");
 }
 
+const PI_STOP_REASON_ERROR = "error";
+
+// Pi reports provider-level failures (auth, entitlement, quota, upstream 5xx) on the
+// assistant message itself — `stopReason: "error"` plus `errorMessage` — and still exits 0.
+// If those never reach `ParsedPiOutput.errors`, the adapter reports the run as SUCCEEDED
+// with zero tokens, the agent is set back to `idle`, and issue recovery misreads the run as
+// a successful-but-dispositionless one. Surface them as errors so the run fails honestly.
+function recordStopReasonError(result: ParsedPiOutput, message: Record<string, unknown> | null): void {
+  if (!message) return;
+  if (asString(message.stopReason, "") !== PI_STOP_REASON_ERROR) return;
+  const detail =
+    asString(message.errorMessage, "").trim() ||
+    "Pi ended the turn with stopReason=error but reported no error message.";
+  if (result.errors.includes(detail)) return;
+  result.errors.push(detail);
+}
+
 export function parsePiJsonl(stdout: string): ParsedPiOutput {
   const result: ParsedPiOutput = {
     sessionId: null,
@@ -71,6 +88,7 @@ export function parsePiJsonl(stdout: string): ParsedPiOutput {
         if (lastMessage?.role === "assistant") {
           const content = lastMessage.content as string | Array<{ type: string; text?: string }>;
           result.finalMessage = extractTextContent(content);
+          recordStopReasonError(result, lastMessage);
         }
       }
       continue;
@@ -93,6 +111,7 @@ export function parsePiJsonl(stdout: string): ParsedPiOutput {
     if (eventType === "turn_end") {
       const message = asRecord(event.message);
       if (message) {
+        recordStopReasonError(result, message);
         const content = message.content as string | Array<{ type: string; text?: string }>;
         const text = extractTextContent(content);
         if (text) {
@@ -225,4 +244,27 @@ export function isPiUnknownSessionError(stdout: string, stderr: string): boolean
     .join("\n");
 
   return /unknown\s+session|session\s+not\s+found|session\s+.*\s+not\s+found|no\s+session/i.test(haystack);
+}
+
+// Provider auth / entitlement failures that no amount of retrying fixes without a human
+// re-authenticating the underlying CLI. Kept deliberately narrow: a 401/403 or an explicit
+// licence/credential complaint. Quota and rate-limit wording is NOT included — those recover
+// on their own and are classified elsewhere.
+const PI_AUTH_REQUIRED_RE =
+  /(?:\b(?:401|403)\b|unauthorized|unauthenticated|permission[_ ]denied|not\s+authenticated|authentication\s+required|invalid\s+credentials|credentials?\s+(?:expired|invalid|missing)|api[_ ]?key\s+(?:required|missing|invalid)|not\s+logged\s+in|login\s+required|please\s+(?:re-?)?authenticate|valid\s+license|licen[sc]e\s+(?:required|missing|invalid)|request\s+a\s+license)/i;
+
+// NOTE: deliberately does NOT scan raw stdout. Pi's JSONL stdout echoes the entire user
+// prompt back, so a wake payload that merely mentions "403" or "unauthorized" would
+// otherwise be misread as a credential failure. Only parsed errors and stderr are trusted.
+export function detectPiAuthRequired(input: {
+  errors: string[];
+  stderr: string;
+}): { requiresAuth: boolean } {
+  const lines = [...input.errors, input.stderr]
+    .join("\n")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  return { requiresAuth: lines.some((line) => PI_AUTH_REQUIRED_RE.test(line)) };
 }

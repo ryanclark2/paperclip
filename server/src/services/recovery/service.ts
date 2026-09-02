@@ -185,6 +185,7 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
 export const FLEET_GATED_CONTINUATION_ERROR_CODES = new Set<string>([
   "claude_auth_required",
   "acpx_auth_required",
+  "pi_auth_required",
 ]);
 
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;

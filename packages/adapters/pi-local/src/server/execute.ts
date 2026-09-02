@@ -46,7 +46,7 @@ import {
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
-import { isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
+import { detectPiAuthRequired, isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
@@ -739,13 +739,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const rawExitCode = attempt.proc.exitCode;
     const parsedError = attempt.parsed.errors.find((error) => error.trim().length > 0) ?? "";
     const effectiveExitCode = (rawExitCode ?? 0) === 0 && parsedError ? 1 : rawExitCode;
+    const failed = (effectiveExitCode ?? 0) !== 0;
     const fallbackErrorMessage = parsedError || stderrLine || `Pi exited with code ${rawExitCode ?? -1}`;
+    const authMeta = detectPiAuthRequired({
+      errors: attempt.parsed.errors,
+      stderr: attempt.proc.stderr,
+    });
 
     return {
       exitCode: effectiveExitCode,
       signal: attempt.proc.signal,
       timedOut: false,
-      errorMessage: (effectiveExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+      errorMessage: failed ? fallbackErrorMessage : null,
+      errorCode: failed && authMeta.requiresAuth ? "pi_auth_required" : null,
       usage: {
         inputTokens: attempt.parsed.usage.inputTokens,
         outputTokens: attempt.parsed.usage.outputTokens,
