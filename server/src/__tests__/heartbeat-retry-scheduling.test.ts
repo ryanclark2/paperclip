@@ -165,6 +165,40 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     await db.delete(companies);
   }
 
+  // Builds the seeded heartbeat_runs.resultJson. Split out of
+  // seedRetryFixture so the three stamp keys are independently expressible:
+  // the two scheduler keys move together (every producer co-writes them),
+  // the recovery lane's own key does not, and the attestation applies to
+  // whichever stamp is present.
+  function buildSeededResultJson(input: {
+    errorFamily?: "transient_upstream" | "provider_quota" | null;
+    retryNotBefore?: string | null;
+    providerQuotaRetryNotBefore?: string | null;
+    retryResetTimeParsed?: boolean | "absent" | { raw: unknown };
+  }) {
+    const attestation = input.retryResetTimeParsed ?? true;
+    const stamped = Boolean(input.retryNotBefore) ||
+      Boolean(input.providerQuotaRetryNotBefore);
+    return {
+      ...(input.errorFamily ? { errorFamily: input.errorFamily } : {}),
+      ...(input.retryNotBefore
+        ? {
+            retryNotBefore: input.retryNotBefore,
+            transientRetryNotBefore: input.retryNotBefore,
+          }
+        : {}),
+      ...(input.providerQuotaRetryNotBefore
+        ? { providerQuotaRetryNotBefore: input.providerQuotaRetryNotBefore }
+        : {}),
+      ...(stamped && attestation !== "absent"
+        ? {
+            transientRetryResetTimeParsed:
+              typeof attestation === "object" ? attestation.raw : attestation,
+          }
+        : {}),
+    };
+  }
+
   async function seedRetryFixture(input: {
     runId: string;
     companyId: string;
@@ -180,7 +214,17 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     // row written before the attestation flag existed, i.e. the whole live
     // DB at deploy. Absent and false must be distinguishable here because
     // the engine collapses them at exactly the guard under test.
-    retryResetTimeParsed?: boolean | "absent";
+    // `{ raw }` writes that exact value in place of a boolean, so a fixture
+    // can pin that the readers are strictly `=== true` and never launder a
+    // truthy non-boolean into an attestation.
+    retryResetTimeParsed?: boolean | "absent" | { raw: unknown };
+    // The recovery lane's own cadence key, deliberately settable ALONE. The
+    // unproven branch of withAdapterFailureRecoveryClassification writes
+    // exactly this key and neither scheduler key. A row carrying it alone is
+    // therefore the only shape that pins WHICH keys the scheduler reads;
+    // without it, "the scheduler ignores this key" is indistinguishable from
+    // "no fixture ever set it" (ALM-7805 B1-r4).
+    providerQuotaRetryNotBefore?: string | null;
     scheduledRetryAttempt?: number;
     resultJson?: Record<string, unknown> | null;
     adapterType?: string;
@@ -224,21 +268,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       finishedAt: input.now,
       scheduledRetryAttempt: input.scheduledRetryAttempt ?? 0,
       scheduledRetryReason: input.scheduledRetryAttempt ? "transient_failure" : null,
-      resultJson: input.resultJson ?? {
-        ...(input.errorFamily ? { errorFamily: input.errorFamily } : {}),
-        ...(input.retryNotBefore
-          ? {
-              retryNotBefore: input.retryNotBefore,
-              transientRetryNotBefore: input.retryNotBefore,
-              ...(input.retryResetTimeParsed === "absent"
-                ? {}
-                : {
-                    transientRetryResetTimeParsed:
-                      input.retryResetTimeParsed ?? true,
-                  }),
-            }
-          : {}),
-      },
+      resultJson: input.resultJson ?? buildSeededResultJson(input),
       contextSnapshot: {
         issueId: randomUUID(),
         wakeReason: "issue_assigned",
@@ -2737,6 +2767,201 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       expect(artifacts.contextSnapshot).not.toHaveProperty("transientRetryNotBefore");
       expect(artifacts.contextSnapshot).not.toHaveProperty("transientRetryDeferralCappedAt");
       expect(artifacts.contextSnapshot).not.toHaveProperty("transientRetryDeferralCapMs");
+    });
+
+    it("never reads the recovery lane's own cadence key as an in-budget hint", async () => {
+      // The unproven branch of withAdapterFailureRecoveryClassification
+      // writes providerQuotaRetryNotBefore and NEITHER scheduler key, and
+      // re-mints it at now + 1h on every recovery pass. That split write is
+      // worth something only if the scheduler's key set really is
+      // {retryNotBefore, transientRetryNotBefore} — and nothing pinned that:
+      // inserting `resultJson.providerQuotaRetryNotBefore ??` at the front of
+      // the scheduler's `??` chain left both suites 72/72 green at
+      // `b7a9161ca` while
+      // reinstating exactly the ALM-7596 B1-r2 laundering the split write
+      // exists to close (ALM-7805 B1-r4; ADR-004 Amendment 6, decoy ahead of
+      // a first-match selector). The row below is the recovery lane's real
+      // output shape: the cadence key alone, attested false.
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date("2026-09-04T12:00:00.000Z");
+      const baseDueAt = new Date(now.getTime() + BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS[0]);
+      const recoveryLaneStamp = new Date(now.getTime() + FIVE_DAYS_MS);
+
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "provider_quota",
+        errorFamily: "provider_quota",
+        adapterType: "claude_local",
+        providerQuotaRetryNotBefore: recoveryLaneStamp.toISOString(),
+        retryResetTimeParsed: false,
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+      });
+
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+      // The pure jittered backoff, not now + cap. Reading the key would
+      // defer this attempt to 14:00 instead of 12:02.
+      expect(scheduled.dueAt.toISOString()).toBe(baseDueAt.toISOString());
+
+      const artifacts = await readScheduledRetryArtifacts(scheduled.run.id, runId);
+      expect(artifacts.scheduledRetryAt?.toISOString()).toBe(baseDueAt.toISOString());
+      // Each absence on its own line: a hint the scheduler read would surface
+      // in all four of these, and a single combined assertion could not say
+      // which one moved.
+      expect(artifacts.contextSnapshot).not.toHaveProperty("transientRetryNotBefore");
+      expect(artifacts.contextSnapshot).not.toHaveProperty("providerQuotaRetryNotBefore");
+      expect(artifacts.contextSnapshot).not.toHaveProperty("transientRetryDeferralCappedAt");
+      expect(artifacts.contextSnapshot).not.toHaveProperty("transientRetryDeferralCapMs");
+    });
+
+    it("never spends the final park on the recovery lane's own cadence key, even attested", async () => {
+      // The other half of the key-set pin. The test above pins the in-budget
+      // deferral against an unproven recovery-lane stamp; a park is gated on
+      // the attestation, so the deferral fixture alone cannot see the
+      // post-budget path move. This row carries the same lone cadence key
+      // WITH an attestation — not a shape the recovery lane produces (it
+      // always pairs its key with `false`), but the decoy that discriminates
+      // the selector: if the scheduler read this key, attempt 5 would park at
+      // the stamp and the vector would gain a fifth "scheduled".
+      // Equality on the whole vector, not a bound (ALM-7699 B1-r3).
+      const outcomes: string[] = [];
+      for (let priorAttempts = 0; priorAttempts <= 6; priorAttempts += 1) {
+        const companyId = randomUUID();
+        const agentId = randomUUID();
+        const runId = randomUUID();
+        const now = new Date("2026-09-04T12:00:00.000Z");
+        const recoveryLaneStamp = new Date(now.getTime() + FIVE_DAYS_MS);
+
+        await seedRetryFixture({
+          runId,
+          companyId,
+          agentId,
+          now,
+          errorCode: "provider_quota",
+          errorFamily: "provider_quota",
+          adapterType: "claude_local",
+          providerQuotaRetryNotBefore: recoveryLaneStamp.toISOString(),
+          retryResetTimeParsed: true,
+          scheduledRetryAttempt: priorAttempts,
+        });
+
+        const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+          now,
+          random: () => 0.5,
+        });
+        outcomes.push(scheduled.outcome);
+
+        await cleanupRetryFixture();
+      }
+
+      expect(outcomes).toEqual([
+        "scheduled",
+        "scheduled",
+        "scheduled",
+        "scheduled",
+        "retry_exhausted",
+        "retry_exhausted",
+        "retry_exhausted",
+      ]);
+    });
+
+    it("follows the scheduler hint over a recovery-lane stamp at a different instant", async () => {
+      // The complement of the two tests above: they pin that the cadence key
+      // is not read when it is the ONLY stamp, this pins that it does not win
+      // when a scheduler key is also present. Together they kill both
+      // "append it to the chain" and "move it to the front". Distinct
+      // instants are the whole point — the one row that already set this key
+      // (the PROVIDER_QUOTA_TEST_ADAPTER stub) makes it byte-identical to
+      // retryNotBefore, so no assertion on that row can tell the keys apart.
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date("2026-09-04T12:00:00.000Z");
+      const hint = new Date(now.getTime() + 30 * 60 * 1000);
+      const recoveryLaneStamp = new Date(now.getTime() + FIVE_DAYS_MS);
+
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "provider_quota",
+        errorFamily: "provider_quota",
+        adapterType: "claude_local",
+        retryNotBefore: hint.toISOString(),
+        providerQuotaRetryNotBefore: recoveryLaneStamp.toISOString(),
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+      });
+
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+      // 30m out and attested: honoured exactly. Reading the decoy would cap
+      // this to 14:00 instead, five days being past the honor horizon.
+      expect(scheduled.dueAt.toISOString()).toBe(hint.toISOString());
+
+      const artifacts = await readScheduledRetryArtifacts(scheduled.run.id, runId);
+      expect(artifacts.scheduledRetryAt?.toISOString()).toBe(hint.toISOString());
+      expect(artifacts.contextSnapshot.transientRetryNotBefore).toBe(hint.toISOString());
+      // The emitted providerQuotaRetryNotBefore mirrors the hint the
+      // scheduler READ, so it reads back as the hint and never as the
+      // seeded decoy.
+      expect(artifacts.contextSnapshot.providerQuotaRetryNotBefore).toBe(hint.toISOString());
+      expect(artifacts.contextSnapshot).not.toHaveProperty("transientRetryDeferralCappedAt");
+      expect(artifacts.contextSnapshot).not.toHaveProperty("transientRetryDeferralCapMs");
+    });
+
+    it("does not accept a truthy non-boolean attestation as a real parse", async () => {
+      // The attestation read is `=== true` on purpose. Relaxing it to
+      // Boolean(...) was 72/72 green at `b7a9161ca` because no producer emits
+      // a truthy non-boolean — but the flag is what buys the 6h horizon over the
+      // 2h probe cadence, so a laundered string would let an unparsed stamp
+      // steer a 6h deferral. A 4h hint sits between the two limits and is the
+      // only instant that can tell them apart (ALM-7805 R-A).
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date("2026-09-04T12:00:00.000Z");
+      const hint = new Date(now.getTime() + 4 * 60 * 60 * 1000);
+      const cappedAt = new Date(now.getTime() + CAP_MS);
+
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "provider_quota",
+        errorFamily: "provider_quota",
+        adapterType: "claude_local",
+        retryNotBefore: hint.toISOString(),
+        retryResetTimeParsed: { raw: "true" },
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+      });
+
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+      expect(scheduled.dueAt.toISOString()).toBe(cappedAt.toISOString());
+
+      const artifacts = await readScheduledRetryArtifacts(scheduled.run.id, runId);
+      expect(artifacts.scheduledRetryAt?.toISOString()).toBe(cappedAt.toISOString());
+      expect(artifacts.contextSnapshot.transientRetryDeferralCappedAt).toBe(cappedAt.toISOString());
+      expect(artifacts.contextSnapshot.transientRetryDeferralCapMs).toBe(CAP_MS);
     });
 
     it("spaces every capped attempt at exactly now + cap while prior attempts accrue", async () => {
