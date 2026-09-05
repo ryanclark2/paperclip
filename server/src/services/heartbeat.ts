@@ -13521,16 +13521,56 @@ export function heartbeatService(
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
 
-    if (!baseSchedule) {
+    // A provider-printed reset hint that is still in the future explains the
+    // failure: the vendor has promised recovery at a known instant, so
+    // spending the unexplained-failure budget must never abandon the run
+    // while that promise is live — before the cap existed, such a wall
+    // self-healed at the printed reset. Keep re-probing once per cap window
+    // until the hint passes; only unexplained failures (no hint, or a hint
+    // already in the past) exhaust terminally.
+    const liveTransientResetHint =
+      transientRetryNotBefore &&
+      transientRetryNotBefore.getTime() > now.getTime()
+        ? transientRetryNotBefore
+        : null;
+    const hintProbeDelayMs =
+      !baseSchedule && liveTransientResetHint
+        ? Math.max(
+            1_000,
+            Math.min(
+              liveTransientResetHint.getTime() - now.getTime(),
+              BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS,
+            ),
+          )
+        : null;
+    const hintProbeSchedule =
+      hintProbeDelayMs !== null
+        ? {
+            attempt: nextAttempt,
+            baseDelayMs: BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS,
+            delayMs: hintProbeDelayMs,
+            dueAt: new Date(now.getTime() + hintProbeDelayMs),
+            maxAttempts,
+          }
+        : null;
+    const effectiveBaseSchedule = baseSchedule ?? hintProbeSchedule;
+
+    if (!effectiveBaseSchedule) {
       await appendRunEvent(run, {
         eventType: "lifecycle",
         stream: "system",
-        level: "warn",
+        level:
+          retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
+            ? "error"
+            : "warn",
         message: `Bounded retry exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts; no further automatic retry will be queued`,
         payload: {
           retryReason,
           scheduledRetryAttempt: run.scheduledRetryAttempt ?? 0,
           maxAttempts,
+          issueId,
+          transientRetryNotBefore:
+            transientRetryNotBefore?.toISOString() ?? null,
         },
       });
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
@@ -13554,6 +13594,24 @@ export function heartbeatService(
         attempt: nextAttempt,
         maxAttempts,
       };
+    }
+
+    if (hintProbeSchedule) {
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: `Bounded retry budget exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts, but the provider reset hint is still ahead; re-probing once per deferral-cap window instead of abandoning the run`,
+        payload: {
+          retryReason,
+          scheduledRetryAttempt: nextAttempt,
+          maxAttempts,
+          issueId,
+          transientRetryNotBefore:
+            liveTransientResetHint?.toISOString() ?? null,
+          scheduledRetryAt: hintProbeSchedule.dueAt.toISOString(),
+        },
+      });
     }
 
     if (retryReason !== MAX_TURN_CONTINUATION_RETRY_REASON) {
@@ -13587,33 +13645,41 @@ export function heartbeatService(
     const providerDeferralCapAt = new Date(
       now.getTime() + BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS,
     );
-    const cappedTransientRetryNotBefore =
-      transientRetryNotBefore &&
-      transientRetryNotBefore.getTime() > providerDeferralCapAt.getTime()
-        ? providerDeferralCapAt
-        : transientRetryNotBefore;
-    const transientRetryDeferralCapPayload =
-      cappedTransientRetryNotBefore &&
-      cappedTransientRetryNotBefore !== transientRetryNotBefore
-        ? {
-            transientRetryDeferralCappedAt:
-              cappedTransientRetryNotBefore.toISOString(),
-            transientRetryDeferralCapMs:
-              BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS,
-          }
-        : null;
+    // Explicit boolean rather than reference identity, so the signal survives
+    // a refactor that rebuilds the Date object in either branch.
+    const transientRetryDeferralWasCapped =
+      transientRetryNotBefore != null &&
+      transientRetryNotBefore.getTime() > providerDeferralCapAt.getTime();
+    const cappedTransientRetryNotBefore = transientRetryDeferralWasCapped
+      ? providerDeferralCapAt
+      : transientRetryNotBefore;
     const schedule =
       cappedTransientRetryNotBefore &&
-      cappedTransientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      cappedTransientRetryNotBefore.getTime() >
+        effectiveBaseSchedule.dueAt.getTime()
         ? {
-            ...baseSchedule,
+            ...effectiveBaseSchedule,
             dueAt: cappedTransientRetryNotBefore,
             delayMs: Math.max(
               0,
               cappedTransientRetryNotBefore.getTime() - now.getTime(),
             ),
           }
-        : baseSchedule;
+        : effectiveBaseSchedule;
+    // Emitted only when the capped instant is the instant the scheduler
+    // actually uses. A truncated hint that then loses the max() against the
+    // jittered backoff did not bind the outcome, and naming it would
+    // advertise an instant the scheduler ignores. When present,
+    // transientRetryDeferralCappedAt always equals scheduledRetryAt.
+    const transientRetryDeferralCapPayload =
+      transientRetryDeferralWasCapped &&
+      schedule.dueAt.getTime() === providerDeferralCapAt.getTime()
+        ? {
+            transientRetryDeferralCappedAt: providerDeferralCapAt.toISOString(),
+            transientRetryDeferralCapMs:
+              BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS,
+          }
+        : null;
 
     const requiresIssueGate =
       retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
@@ -21526,7 +21592,25 @@ export function heartbeatService(
             outcome === "failed" &&
             readTransientRecoveryContractFromRun(livenessRun)
           ) {
-            await scheduleBoundedRetryForRun(livenessRun, agent);
+            const transientRetryResult = await scheduleBoundedRetryForRun(
+              livenessRun,
+              agent,
+            );
+            if (transientRetryResult.outcome === "retry_exhausted") {
+              // Terminal abandonment. A live provider reset hint schedules a
+              // capped re-probe instead of reaching this arm, so exhaustion
+              // here means the failures are unexplained; the stranded-issue
+              // recovery classifier owns the issue's disposition from here.
+              logger.error(
+                {
+                  runId: livenessRun.id,
+                  issueId,
+                  attempt: transientRetryResult.attempt,
+                  maxAttempts: transientRetryResult.maxAttempts,
+                },
+                "bounded transient retry budget exhausted with no live provider reset hint; no further automatic retry will be queued",
+              );
+            }
           }
           const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
             livenessRun,
