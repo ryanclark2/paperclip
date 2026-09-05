@@ -13682,13 +13682,22 @@ export function heartbeatService(
     // a refactor that rebuilds the Date object in either branch.
     // A hint at or inside the honor horizon is honoured exactly (session-
     // class walls are near-total; parking short of the printed reset only
-    // burns dispatches). Only a hint beyond the horizon is capped down to
-    // the probe cadence. The final post-budget park is naturally exempt:
-    // its dueAt is the printed reset itself, later than the capped instant,
-    // so the later-wins selection below keeps it.
+    // burns dispatches) — but the horizon is earned by the writer's parse
+    // attestation. An unproven stamp (attested false, or written before the
+    // attestation flag existed — every pre-existing heartbeat_runs row) only
+    // ever gets the probe-cadence cap: the horizon is a raise over the cap
+    // those rows were written under, and extending it to stamps nobody
+    // parsed would let legacy rows steer a 6h deferral. A hint beyond its
+    // honor limit is capped down to the probe cadence. The final post-budget
+    // park is naturally exempt: its dueAt is the printed reset itself, later
+    // than the capped instant, so the later-wins selection below keeps it.
+    const transientRetryHintHonorLimitAt = transientRetryResetTimeParsed
+      ? hintHonorHorizonAt
+      : providerDeferralCapAt;
     const transientRetryDeferralWasCapped =
       transientRetryNotBefore != null &&
-      transientRetryNotBefore.getTime() > hintHonorHorizonAt.getTime();
+      transientRetryNotBefore.getTime() >
+        transientRetryHintHonorLimitAt.getTime();
     const cappedTransientRetryNotBefore = transientRetryDeferralWasCapped
       ? providerDeferralCapAt
       : transientRetryNotBefore;

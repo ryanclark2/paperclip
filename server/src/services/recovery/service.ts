@@ -508,14 +508,60 @@ export function classifyAdapterFailureForRecovery(
   }
   if (persistedRetryAtIsLive) {
     // Unproven sticky stamp with nothing parseable in the error: keep the
-    // monitor cadence fixed at it (no creep from re-minting), but do not
-    // claim a parse.
+    // monitor cadence fixed at it, but do not claim a parse. Fixed-at-stamp
+    // holds only when the sticky stamp is the first non-empty scheduler key:
+    // the `??` selection above is first-non-empty, not first-live, so a
+    // lapsed earlier key shadows a live later one and drops through to the
+    // re-minted default backoff below (one re-mint of creep per pass).
     return { kind: "provider_quota", retryAt: parsedPersistedRetryAt, parsedResetTime: false };
   }
   return {
     kind: "provider_quota",
     retryAt: new Date(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS),
     parsedResetTime: false,
+  };
+}
+
+// Module-level and exported so the unproven branch's key exclusion is
+// directly testable: this is the single point where a classification fans
+// out into the scheduler keys, and which keys it writes is the contract the
+// bounded-retry scheduler's attestation gate depends on.
+export function withAdapterFailureRecoveryClassification(
+  latestRun: NonNullable<LatestIssueRun>,
+  classification: NonNullable<AdapterFailureRecoveryClassification>,
+): NonNullable<LatestIssueRun> {
+  const resultJson = parseObject(latestRun.resultJson);
+  const providerQuotaMetadata = classification.kind === "provider_quota"
+    ? classification.parsedResetTime
+      ? {
+          errorFamily: "provider_quota",
+          retryNotBefore: classification.retryAt.toISOString(),
+          transientRetryNotBefore: classification.retryAt.toISOString(),
+          transientRetryResetTimeParsed: true,
+          providerQuotaRetryNotBefore: classification.retryAt.toISOString(),
+        }
+      : {
+          // A synthetic default-backoff stamp is the recovery lane's own
+          // cadence, not a vendor promise: keep it out of the two keys the
+          // bounded-retry scheduler reads (`retryNotBefore` /
+          // `transientRetryNotBefore`), or it inflates in-budget deferrals
+          // and — before ALM-7596 — extended post-budget probing without
+          // bound as each lapsed stamp was re-minted an hour ahead.
+          errorFamily: "provider_quota",
+          transientRetryResetTimeParsed: false,
+          providerQuotaRetryNotBefore: classification.retryAt.toISOString(),
+        }
+    : { errorFamily: "configuration_incomplete" };
+  const errorCode = classification.kind;
+
+  return {
+    ...latestRun,
+    errorCode,
+    resultJson: {
+      ...resultJson,
+      ...providerQuotaMetadata,
+      recoveryClassification: errorCode,
+    },
   };
 }
 
@@ -3339,45 +3385,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .where(eq(heartbeatRuns.id, latestRun.id));
 
     return classifiedRun;
-  }
-
-  function withAdapterFailureRecoveryClassification(
-    latestRun: NonNullable<LatestIssueRun>,
-    classification: NonNullable<AdapterFailureRecoveryClassification>,
-  ): NonNullable<LatestIssueRun> {
-    const resultJson = parseObject(latestRun.resultJson);
-    const providerQuotaMetadata = classification.kind === "provider_quota"
-      ? classification.parsedResetTime
-        ? {
-            errorFamily: "provider_quota",
-            retryNotBefore: classification.retryAt.toISOString(),
-            transientRetryNotBefore: classification.retryAt.toISOString(),
-            transientRetryResetTimeParsed: true,
-            providerQuotaRetryNotBefore: classification.retryAt.toISOString(),
-          }
-        : {
-            // A synthetic default-backoff stamp is the recovery lane's own
-            // cadence, not a vendor promise: keep it out of the two keys the
-            // bounded-retry scheduler reads (`retryNotBefore` /
-            // `transientRetryNotBefore`), or it inflates in-budget deferrals
-            // and — before ALM-7596 — extended post-budget probing without
-            // bound as each lapsed stamp was re-minted an hour ahead.
-            errorFamily: "provider_quota",
-            transientRetryResetTimeParsed: false,
-            providerQuotaRetryNotBefore: classification.retryAt.toISOString(),
-          }
-      : { errorFamily: "configuration_incomplete" };
-    const errorCode = classification.kind;
-
-    return {
-      ...latestRun,
-      errorCode,
-      resultJson: {
-        ...resultJson,
-        ...providerQuotaMetadata,
-        recoveryClassification: errorCode,
-      },
-    };
   }
 
   async function scheduleProviderQuotaRecoveryMonitor(input: {

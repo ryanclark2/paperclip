@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS,
   classifyAdapterFailureForRecovery,
+  withAdapterFailureRecoveryClassification,
 } from "./service.js";
 
 describe("classifyAdapterFailureForRecovery", () => {
@@ -139,6 +140,32 @@ describe("classifyAdapterFailureForRecovery", () => {
     });
   });
 
+  it("treats a live stamp whose row has no attestation key at all as unproven (legacy rows)", () => {
+    // The absent state is the day-one input class: every heartbeat_runs row
+    // written before the attestation flag existed carries the scheduler keys
+    // with no transientRetryResetTimeParsed key at all. Absent must read
+    // exactly like attested-false — keep the stamp for cadence, never claim
+    // a parse. Weakening the gate at the persisted-stamp read from
+    // `=== true` to `!== false` flips this row to parsedResetTime: true and
+    // re-persists both scheduler keys plus a true attestation, re-opening
+    // the laundering chain for the whole legacy DB (ALM-7699 B1-r3).
+    const now = new Date("2026-09-04T20:00:00.000Z");
+    const classification = classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: "Provider quota exceeded for this model.",
+      resultJson: {
+        retryNotBefore: "2026-09-09T16:00:00.000Z",
+        transientRetryNotBefore: "2026-09-09T16:00:00.000Z",
+      },
+    }, now);
+
+    expect(classification).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-09-09T16:00:00.000Z"),
+      parsedResetTime: false,
+    });
+  });
+
   it.each([
     "model_not_found: requested model does not exist",
     "No API credentials were found for this provider",
@@ -165,5 +192,65 @@ describe("classifyAdapterFailureForRecovery", () => {
       error: "Workspace storage capacity limit reached.",
       resultJson: null,
     })).toBeNull();
+  });
+});
+
+describe("withAdapterFailureRecoveryClassification", () => {
+  // The single point where a classification fans out into persisted keys.
+  // Which keys the unproven branch writes is the contract the bounded-retry
+  // scheduler's attestation gate depends on, so it is pinned here directly
+  // rather than only through the classifier (ALM-7699 B1-r3 split-write pin).
+  function failedQuotaRun() {
+    return {
+      id: "run-under-classification",
+      agentId: "agent-under-classification",
+      status: "failed",
+      error: "Provider quota exceeded for this model.",
+      errorCode: "provider_quota",
+      contextSnapshot: null,
+      livenessState: null,
+      startedAt: new Date("2026-09-04T19:00:00.000Z"),
+      createdAt: new Date("2026-09-04T19:00:00.000Z"),
+      resultJson: null,
+    };
+  }
+
+  it("fans a proven parse out into both scheduler keys with a true attestation", () => {
+    const classified = withAdapterFailureRecoveryClassification(failedQuotaRun(), {
+      kind: "provider_quota",
+      retryAt: new Date("2026-09-09T16:00:00.000Z"),
+      parsedResetTime: true,
+    });
+
+    expect(classified.errorCode).toBe("provider_quota");
+    expect(classified.resultJson).toEqual({
+      errorFamily: "provider_quota",
+      retryNotBefore: "2026-09-09T16:00:00.000Z",
+      transientRetryNotBefore: "2026-09-09T16:00:00.000Z",
+      transientRetryResetTimeParsed: true,
+      providerQuotaRetryNotBefore: "2026-09-09T16:00:00.000Z",
+      recoveryClassification: "provider_quota",
+    });
+  });
+
+  it("keeps an unproven classification out of both scheduler keys, each pinned independently", () => {
+    const classified = withAdapterFailureRecoveryClassification(failedQuotaRun(), {
+      kind: "provider_quota",
+      retryAt: new Date("2026-09-04T21:00:00.000Z"),
+      parsedResetTime: false,
+    });
+
+    // Two separate absence assertions on purpose: re-adding either scheduler
+    // key alone to the unproven branch must fail on its own line, so each
+    // key's guard is load-bearing rather than redundant with the other's.
+    expect(classified.resultJson).not.toHaveProperty("retryNotBefore");
+    expect(classified.resultJson).not.toHaveProperty("transientRetryNotBefore");
+    expect(classified.errorCode).toBe("provider_quota");
+    expect(classified.resultJson).toEqual({
+      errorFamily: "provider_quota",
+      transientRetryResetTimeParsed: false,
+      providerQuotaRetryNotBefore: "2026-09-04T21:00:00.000Z",
+      recoveryClassification: "provider_quota",
+    });
   });
 });
