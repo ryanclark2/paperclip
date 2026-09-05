@@ -3044,6 +3044,71 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       );
     });
 
+    // Lifted from the CTO's ALM-7583 round-2 seat (CTO-R2/CTO-R3), adapted to
+    // the round-3 final-park arm: the floor and the liveness boundary both
+    // moved into the post-budget park, so the fixtures seed a spent budget.
+    it("CTO-R2: floors a sub-second live hint's final park at now + 1s instead of scheduling immediately", async () => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date("2026-09-04T12:00:00.000Z");
+      const rawHint = new Date(now.getTime() + 1);
+
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "provider_quota",
+        errorFamily: "provider_quota",
+        adapterType: "claude_local",
+        retryNotBefore: rawHint.toISOString(),
+        scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+      });
+
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+      expect(scheduled.attempt).toBe(
+        BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length + 1,
+      );
+      expect(scheduled.dueAt.toISOString()).toBe("2026-09-04T12:00:01.000Z");
+    });
+
+    it("CTO-R3: a hint at exactly now is not live and exhausts terminally", async () => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date("2026-09-04T12:00:00.000Z");
+
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "provider_quota",
+        errorFamily: "provider_quota",
+        adapterType: "claude_local",
+        retryNotBefore: now.toISOString(),
+        scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
+      });
+
+      const exhausted = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+      });
+
+      expect(exhausted).toEqual({
+        outcome: "retry_exhausted",
+        attempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length + 1,
+        maxAttempts: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
+      });
+    });
+
     it("omits the capped-at payload when the jittered backoff overtakes the capped hint", async () => {
       const companyId = randomUUID();
       const agentId = randomUUID();
