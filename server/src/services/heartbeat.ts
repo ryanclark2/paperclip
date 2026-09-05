@@ -599,6 +599,14 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
   30 * 60 * 1000,
   2 * 60 * 60 * 1000,
 ] as const;
+// Upper bound on how far a provider-printed retry-not-before hint may defer a
+// bounded transient retry. Matches the last entry of the backoff table: the
+// scheduler already tolerates that gap between attempts on its own, so a
+// longer vendor wall gets re-probed once per cap window instead of parking
+// the run until the printed reset date. Hints at or below the cap are still
+// honoured exactly.
+export const BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS =
+  2 * 60 * 60 * 1000;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
@@ -13576,15 +13584,33 @@ export function heartbeatService(
       }
     }
 
-    const schedule =
+    const providerDeferralCapAt = new Date(
+      now.getTime() + BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS,
+    );
+    const cappedTransientRetryNotBefore =
       transientRetryNotBefore &&
-      transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      transientRetryNotBefore.getTime() > providerDeferralCapAt.getTime()
+        ? providerDeferralCapAt
+        : transientRetryNotBefore;
+    const transientRetryDeferralCapPayload =
+      cappedTransientRetryNotBefore &&
+      cappedTransientRetryNotBefore !== transientRetryNotBefore
+        ? {
+            transientRetryDeferralCappedAt:
+              cappedTransientRetryNotBefore.toISOString(),
+            transientRetryDeferralCapMs:
+              BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS,
+          }
+        : null;
+    const schedule =
+      cappedTransientRetryNotBefore &&
+      cappedTransientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
         ? {
             ...baseSchedule,
-            dueAt: transientRetryNotBefore,
+            dueAt: cappedTransientRetryNotBefore,
             delayMs: Math.max(
               0,
-              transientRetryNotBefore.getTime() - now.getTime(),
+              cappedTransientRetryNotBefore.getTime() - now.getTime(),
             ),
           }
         : baseSchedule;
@@ -13686,6 +13712,7 @@ export function heartbeatService(
                 transientRetryNotBefore.toISOString(),
             }
           : {}),
+        ...(transientRetryDeferralCapPayload ?? {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
       },
       "normal_model",
@@ -13978,6 +14005,7 @@ export function heartbeatService(
                         transientRetryNotBefore.toISOString(),
                     }
                   : {}),
+                ...(transientRetryDeferralCapPayload ?? {}),
                 ...(codexTransientFallbackMode
                   ? { codexTransientFallbackMode }
                   : {}),
@@ -14229,6 +14257,7 @@ export function heartbeatService(
                 transientRetryNotBefore.toISOString(),
             }
           : {}),
+        ...(transientRetryDeferralCapPayload ?? {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
       },
     });
