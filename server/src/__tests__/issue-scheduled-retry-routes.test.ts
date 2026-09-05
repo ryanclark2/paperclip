@@ -521,6 +521,13 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       .send({});
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
+    // Equality, not `toContain`: this pins the *action string* the guard asks
+    // about. Swapping `runtime:manage` for a weaker action still denies this
+    // low-trust fixture, so only the message distinguishes the two guards.
+    expect(res.body).toEqual({
+      error: "low_trust_review agents cannot use company-wide or privileged runtime:manage APIs by default.",
+      details: { reason: "deny_low_trust_boundary" },
+    });
 
     const [run] = await db
       .select({ status: heartbeatRuns.status, scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
@@ -534,6 +541,29 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       .from(activityLog)
       .where(eq(activityLog.entityId, issueId));
     expect(activity).toEqual([]);
+  });
+
+  it("holds an authorized agent caller to the same promotion gates as the board", async () => {
+    const { companyId, agentId, issueId, retryRunId } = await seedIssueWithRetry({ agentStatus: "paused" });
+    const peerAgentId = await seedPeerAgent(companyId, {});
+
+    const res = await request(createApp(agentActor(companyId, peerAgentId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    // Widening the guard must not widen what gets promoted. Note the gate is
+    // destructive for every caller: a suppressed retry is cancelled, not left
+    // parked, so calling this during the wall that caused the park destroys
+    // the retry. Pre-existing behaviour, but agents can now reach it.
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.outcome).toBe("gate_suppressed");
+
+    const [run] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    expect(run).toEqual({ status: "cancelled", errorCode: "agent_not_invokable" });
+    expect(peerAgentId).not.toBe(agentId);
   });
 
   it("refuses an agent actor with no agent id on an unassigned issue", async () => {
