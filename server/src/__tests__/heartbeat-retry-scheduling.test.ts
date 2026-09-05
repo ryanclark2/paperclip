@@ -43,6 +43,7 @@ vi.mock("@paperclipai/shared/telemetry", async () => {
 });
 
 import {
+  BOUNDED_TRANSIENT_HEARTBEAT_HINT_HONOR_HORIZON_MS,
   BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS,
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
@@ -172,6 +173,10 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     errorCode: string;
     errorFamily?: "transient_upstream" | "provider_quota" | null;
     retryNotBefore?: string | null;
+    // Whether the seeded stamp carries the writer's parse attestation.
+    // Defaults to true, matching adapter-written rows: an adapter-reported
+    // retry-not-before is a parse of the vendor error by construction.
+    retryResetTimeParsed?: boolean;
     scheduledRetryAttempt?: number;
     resultJson?: Record<string, unknown> | null;
     adapterType?: string;
@@ -221,6 +226,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
           ? {
               retryNotBefore: input.retryNotBefore,
               transientRetryNotBefore: input.retryNotBefore,
+              transientRetryResetTimeParsed: input.retryResetTimeParsed ?? true,
             }
           : {}),
       },
@@ -270,6 +276,13 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(failedRun?.status).toBe("failed");
     expect(failedRun?.errorCode).toBe("provider_quota");
     expect((failedRun?.resultJson as Record<string, unknown> | null)?.errorFamily).toBe("provider_quota");
+    // The adapter-reported hint is a parse of the vendor error by
+    // construction, so the merge path must attest it — post-budget honor
+    // is gated on this flag.
+    expect(
+      (failedRun?.resultJson as Record<string, unknown> | null)
+        ?.transientRetryResetTimeParsed,
+    ).toBe(true);
 
     await expect
       .poll(
@@ -2376,6 +2389,16 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       );
     });
 
+    it("pins the hint honor horizon constant at exactly six hours", () => {
+      // Independent literal for the same ADR-004 Amendment 6 reason. The
+      // horizon and the cap are distinct on purpose: the horizon says which
+      // printed resets are honoured exactly (session-class walls), the cap
+      // says how often to probe a wall whose reset sits beyond it.
+      expect(BOUNDED_TRANSIENT_HEARTBEAT_HINT_HONOR_HORIZON_MS).toBe(
+        6 * 60 * 60 * 1000,
+      );
+    });
+
     async function readScheduledRetryArtifacts(scheduledRunId: string, sourceRunId: string) {
       const retryRun = await db
         .select({
@@ -2526,6 +2549,119 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       expect(artifacts.contextSnapshot).not.toHaveProperty("transientRetryDeferralCapMs");
     });
 
+    it("honours a session-class hint hours out exactly, up to the horizon", async () => {
+      // The 2026-09-04 session-limit episode: the printed reset (3.6h out)
+      // was accurate to within seconds, and every dispatch before it died at
+      // zero tokens. A hint inside the honor horizon parks AT the reset —
+      // capping it to the probe cadence would have burned ~109 more
+      // dispatches into a near-total wall (ALM-7482 CTO correction).
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date("2026-09-04T12:00:00.000Z");
+      const rawHint = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "provider_quota",
+        errorFamily: "provider_quota",
+        adapterType: "claude_local",
+        retryNotBefore: rawHint.toISOString(),
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+      });
+
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+      // Hardcoded literal: 12:00 + 3h. Under the round-2 flat 2h cap this
+      // schedule landed at 14:00; any regression back to capping re-fails
+      // this exact assertion.
+      expect(scheduled.dueAt.toISOString()).toBe("2026-09-04T15:00:00.000Z");
+
+      const artifacts = await readScheduledRetryArtifacts(scheduled.run.id, runId);
+      expect(artifacts.scheduledRetryAt?.toISOString()).toBe("2026-09-04T15:00:00.000Z");
+      expect(artifacts.contextSnapshot).not.toHaveProperty("transientRetryDeferralCappedAt");
+      expect(artifacts.contextSnapshot).not.toHaveProperty("transientRetryDeferralCapMs");
+    });
+
+    it("honours a hint at exactly now + horizon, unclamped", async () => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date("2026-09-04T12:00:00.000Z");
+      const rawHint = new Date(
+        now.getTime() + BOUNDED_TRANSIENT_HEARTBEAT_HINT_HONOR_HORIZON_MS,
+      );
+
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "provider_quota",
+        errorFamily: "provider_quota",
+        adapterType: "claude_local",
+        retryNotBefore: rawHint.toISOString(),
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+      });
+
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+      expect(scheduled.dueAt.toISOString()).toBe("2026-09-04T18:00:00.000Z");
+
+      const artifacts = await readScheduledRetryArtifacts(scheduled.run.id, runId);
+      expect(artifacts.scheduledRetryAt?.toISOString()).toBe("2026-09-04T18:00:00.000Z");
+      expect(artifacts.contextSnapshot).not.toHaveProperty("transientRetryDeferralCappedAt");
+    });
+
+    it("caps a hint just past the horizon to the probe cadence, not to the horizon", async () => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date("2026-09-04T12:00:00.000Z");
+      const rawHint = new Date(
+        now.getTime() + BOUNDED_TRANSIENT_HEARTBEAT_HINT_HONOR_HORIZON_MS + 60 * 1000,
+      );
+
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "provider_quota",
+        errorFamily: "provider_quota",
+        adapterType: "claude_local",
+        retryNotBefore: rawHint.toISOString(),
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+      });
+
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+      // A beyond-horizon wall is probed once per CAP window (12:00 + 2h),
+      // not parked at the horizon (18:00) and not at the printed reset
+      // (18:01). Both wrong instants are excluded by the hardcoded literal.
+      expect(scheduled.dueAt.toISOString()).toBe("2026-09-04T14:00:00.000Z");
+
+      const artifacts = await readScheduledRetryArtifacts(scheduled.run.id, runId);
+      expect(artifacts.scheduledRetryAt?.toISOString()).toBe("2026-09-04T14:00:00.000Z");
+      expect(artifacts.contextSnapshot.transientRetryDeferralCappedAt).toBe("2026-09-04T14:00:00.000Z");
+      expect(artifacts.contextSnapshot.transientRetryDeferralCapMs).toBe(CAP_MS);
+    });
+
     it("still ignores a hint earlier than the bounded backoff due time", async () => {
       const companyId = randomUUID();
       const agentId = randomUUID();
@@ -2635,7 +2771,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       }
     });
 
-    it("re-probes at the cap instead of abandoning when the budget is spent but the reset hint is live", async () => {
+    it("takes one final park at the printed reset when the budget is spent and the parsed hint is live", async () => {
       const companyId = randomUUID();
       const agentId = randomUUID();
       const runId = randomUUID();
@@ -2659,23 +2795,28 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         random: () => 0.5,
       });
 
-      // The long-lockout class (e.g. an 18h vendor quota wall): the budget is
-      // spent but the vendor still promises recovery, so the run defers one
-      // more cap window (hardcoded now + cap) instead of exhausting.
+      // The long-lockout class (e.g. a 5-day weekly quota wall): the budget
+      // of dense probes is spent and the vendor still promises recovery, so
+      // the run rides the promise out ONCE — a single park at the printed
+      // reset itself (hardcoded literal) — instead of exhausting, and
+      // instead of re-probing once per cap window without bound (ALM-7596
+      // B1-r2: that treadmill produced 60 schedules for this exact fixture).
       expect(scheduled.outcome).toBe("scheduled");
       if (scheduled.outcome !== "scheduled") return;
-      expect(scheduled.dueAt.toISOString()).toBe("2026-09-04T14:00:00.000Z");
+      expect(scheduled.dueAt.toISOString()).toBe("2026-09-09T12:00:00.000Z");
 
       const artifacts = await readScheduledRetryArtifacts(scheduled.run.id, runId);
-      expect(artifacts.scheduledRetryAt?.toISOString()).toBe("2026-09-04T14:00:00.000Z");
+      expect(artifacts.scheduledRetryAt?.toISOString()).toBe("2026-09-09T12:00:00.000Z");
       expect(artifacts.contextSnapshot.scheduledRetryAttempt).toBe(
         BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length + 1,
       );
       expect(artifacts.contextSnapshot.transientRetryNotBefore).toBe(rawHint.toISOString());
-      expect(artifacts.contextSnapshot.transientRetryDeferralCappedAt).toBe("2026-09-04T14:00:00.000Z");
-      expect(artifacts.contextSnapshot.transientRetryDeferralCapMs).toBe(CAP_MS);
+      // The final park is the printed reset, not a truncated instant — no
+      // capped-at payload may name a time the scheduler is not using.
+      expect(artifacts.contextSnapshot).not.toHaveProperty("transientRetryDeferralCappedAt");
+      expect(artifacts.contextSnapshot).not.toHaveProperty("transientRetryDeferralCapMs");
 
-      const probeEvent = await db
+      const parkEvent = await db
         .select({
           message: heartbeatRunEvents.message,
           payload: heartbeatRunEvents.payload,
@@ -2688,12 +2829,122 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
           ),
         )
         .then((rows) => rows[0] ?? null);
-      expect(probeEvent?.message).toContain("re-probing once per deferral-cap window");
-      expect(probeEvent?.payload).toMatchObject({
+      expect(parkEvent?.message).toContain("one final park at the printed reset");
+      expect(parkEvent?.payload).toMatchObject({
         retryReason: "transient_failure",
         transientRetryNotBefore: rawHint.toISOString(),
-        scheduledRetryAt: "2026-09-04T14:00:00.000Z",
+        scheduledRetryAt: "2026-09-09T12:00:00.000Z",
       });
+    });
+
+    it("exhausts terminally on the next failure after the final hint park", async () => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date("2026-09-04T12:00:00.000Z");
+      const rawHint = new Date(now.getTime() + FIVE_DAYS_MS);
+
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "provider_quota",
+        errorFamily: "provider_quota",
+        adapterType: "claude_local",
+        retryNotBefore: rawHint.toISOString(),
+        scheduledRetryAttempt:
+          BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length + 1,
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+      });
+
+      // Attempt maxAttempts+1 was the final park. A live parsed hint does
+      // not extend the chain again — the post-budget allowance is exactly
+      // one schedule, so the episode is bounded on the count axis even
+      // against a vendor that keeps printing future resets (ALM-7596 B1-r2).
+      expect(scheduled.outcome).toBe("retry_exhausted");
+    });
+
+    it("never spends the final park on a stamp whose writer attested no parse", async () => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date("2026-09-04T12:00:00.000Z");
+      // The recovery classifier's synthetic default-backoff shape: a live
+      // stamp exactly one hour ahead, re-minted each time it lapses. Before
+      // ALM-7596 this class produced 296 post-budget probes across 301
+      // simulated hours with retry_exhausted unreachable (B1-r2).
+      const rawHint = new Date(now.getTime() + 60 * 60 * 1000);
+
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "provider_quota",
+        errorFamily: "provider_quota",
+        adapterType: "claude_local",
+        retryNotBefore: rawHint.toISOString(),
+        retryResetTimeParsed: false,
+        scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+      });
+
+      expect(scheduled.outcome).toBe("retry_exhausted");
+    });
+
+    it("bounds a whole fixed-far-hint episode to maxAttempts+1 schedules, then exhausts", async () => {
+      // Episode-level pin of the B1-r2 count bound: one stranded run failing
+      // repeatedly against a fixed 5-day reset schedules exactly
+      // maxAttempts (dense probes) + 1 (final park at the reset), and every
+      // scheduling call after that exhausts. At 32b8dca0e this same episode
+      // produced 60 schedules.
+      const outcomes: string[] = [];
+      for (let priorAttempts = 0; priorAttempts <= 6; priorAttempts += 1) {
+        const companyId = randomUUID();
+        const agentId = randomUUID();
+        const runId = randomUUID();
+        const now = new Date("2026-09-04T12:00:00.000Z");
+        const rawHint = new Date(now.getTime() + FIVE_DAYS_MS);
+
+        await seedRetryFixture({
+          runId,
+          companyId,
+          agentId,
+          now,
+          errorCode: "provider_quota",
+          errorFamily: "provider_quota",
+          adapterType: "claude_local",
+          retryNotBefore: rawHint.toISOString(),
+          scheduledRetryAttempt: priorAttempts,
+        });
+
+        const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+          now,
+          random: () => 0.5,
+        });
+        outcomes.push(scheduled.outcome);
+
+        await cleanupRetryFixture();
+      }
+
+      expect(outcomes).toEqual([
+        "scheduled",
+        "scheduled",
+        "scheduled",
+        "scheduled",
+        "scheduled",
+        "retry_exhausted",
+        "retry_exhausted",
+      ]);
     });
 
     it("defers to the hint itself at spent budget when the hint is nearer than the cap", async () => {

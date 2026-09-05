@@ -490,13 +490,27 @@ export function classifyAdapterFailureForRecovery(
     readNonEmptyString(resultJson.transientRetryNotBefore) ??
     readNonEmptyString(resultJson.providerQuotaRetryNotBefore);
   const parsedPersistedRetryAt = persistedRetryAt ? new Date(persistedRetryAt) : null;
-  if (parsedPersistedRetryAt && !Number.isNaN(parsedPersistedRetryAt.getTime()) && parsedPersistedRetryAt > now) {
+  const persistedRetryAtIsLive = parsedPersistedRetryAt != null &&
+    !Number.isNaN(parsedPersistedRetryAt.getTime()) &&
+    parsedPersistedRetryAt > now;
+  // A persisted stamp is only a vendor promise when its writer attested a
+  // real parse. Re-reporting an unproven stamp as parsed laundered the
+  // synthetic default-backoff stamp into `parsedResetTime: true` on every
+  // pass while it was live (ALM-7596 B1-r2).
+  const persistedResetTimeParsed = resultJson.transientRetryResetTimeParsed === true;
+  if (persistedRetryAtIsLive && persistedResetTimeParsed) {
     return { kind: "provider_quota", retryAt: parsedPersistedRetryAt, parsedResetTime: true };
   }
 
   const parsedClockReset = parseProviderQuotaClockReset(error, now);
   if (parsedClockReset) {
     return { kind: "provider_quota", retryAt: parsedClockReset, parsedResetTime: true };
+  }
+  if (persistedRetryAtIsLive) {
+    // Unproven sticky stamp with nothing parseable in the error: keep the
+    // monitor cadence fixed at it (no creep from re-minting), but do not
+    // claim a parse.
+    return { kind: "provider_quota", retryAt: parsedPersistedRetryAt, parsedResetTime: false };
   }
   return {
     kind: "provider_quota",
@@ -3333,12 +3347,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   ): NonNullable<LatestIssueRun> {
     const resultJson = parseObject(latestRun.resultJson);
     const providerQuotaMetadata = classification.kind === "provider_quota"
-      ? {
-          errorFamily: "provider_quota",
-          retryNotBefore: classification.retryAt.toISOString(),
-          transientRetryNotBefore: classification.retryAt.toISOString(),
-          providerQuotaRetryNotBefore: classification.retryAt.toISOString(),
-        }
+      ? classification.parsedResetTime
+        ? {
+            errorFamily: "provider_quota",
+            retryNotBefore: classification.retryAt.toISOString(),
+            transientRetryNotBefore: classification.retryAt.toISOString(),
+            transientRetryResetTimeParsed: true,
+            providerQuotaRetryNotBefore: classification.retryAt.toISOString(),
+          }
+        : {
+            // A synthetic default-backoff stamp is the recovery lane's own
+            // cadence, not a vendor promise: keep it out of the two keys the
+            // bounded-retry scheduler reads (`retryNotBefore` /
+            // `transientRetryNotBefore`), or it inflates in-budget deferrals
+            // and — before ALM-7596 — extended post-budget probing without
+            // bound as each lapsed stamp was re-minted an hour ahead.
+            errorFamily: "provider_quota",
+            transientRetryResetTimeParsed: false,
+            providerQuotaRetryNotBefore: classification.retryAt.toISOString(),
+          }
       : { errorFamily: "configuration_incomplete" };
     const errorCode = classification.kind;
 

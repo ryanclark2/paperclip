@@ -81,6 +81,64 @@ describe("classifyAdapterFailureForRecovery", () => {
     });
   });
 
+  it("prefers a live persisted stamp whose writer attested a real parse", () => {
+    const now = new Date("2026-09-04T20:00:00.000Z");
+    const classification = classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: "You've hit your weekly limit · resets Sep 9 at 9am",
+      resultJson: {
+        transientRetryNotBefore: "2026-09-09T16:00:00.000Z",
+        transientRetryResetTimeParsed: true,
+      },
+    }, now);
+
+    expect(classification).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-09-09T16:00:00.000Z"),
+      parsedResetTime: true,
+    });
+  });
+
+  it("lets a fresh clock parse beat a live stamp that carries no parse attestation", () => {
+    const now = new Date("2026-09-04T20:00:00.000Z");
+    const classification = classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: "You've hit your usage limit. Try again at 21:30 (UTC).",
+      resultJson: {
+        // A synthetic default-backoff stamp persisted by an earlier pass.
+        providerQuotaRetryNotBefore: "2026-09-04T20:30:00.000Z",
+        transientRetryResetTimeParsed: false,
+      },
+    }, now);
+
+    expect(classification).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-09-04T21:30:00.000Z"),
+      parsedResetTime: true,
+    });
+  });
+
+  it("keeps an unproven sticky stamp but never reports it as parsed", () => {
+    // Before ALM-7596 B1-r2 this branch returned parsedResetTime: true,
+    // laundering the synthetic default-backoff stamp into a vendor promise
+    // on every pass while it was live.
+    const now = new Date("2026-09-04T20:00:00.000Z");
+    const classification = classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: "Provider quota exceeded for this model.",
+      resultJson: {
+        providerQuotaRetryNotBefore: "2026-09-04T20:30:00.000Z",
+        transientRetryResetTimeParsed: false,
+      },
+    }, now);
+
+    expect(classification).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-09-04T20:30:00.000Z"),
+      parsedResetTime: false,
+    });
+  });
+
   it.each([
     "model_not_found: requested model does not exist",
     "No API credentials were found for this provider",

@@ -599,12 +599,19 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
   30 * 60 * 1000,
   2 * 60 * 60 * 1000,
 ] as const;
-// Upper bound on how far a provider-printed retry-not-before hint may defer a
-// bounded transient retry. Matches the last entry of the backoff table: the
-// scheduler already tolerates that gap between attempts on its own, so a
-// longer vendor wall gets re-probed once per cap window instead of parking
-// the run until the printed reset date. Hints at or below the cap are still
-// honoured exactly.
+// Horizon below which a provider-printed retry-not-before hint is honoured
+// exactly. Session-class walls are near-total and their printed reset is
+// accurate (measured 2026-09-04: 109 failed dispatches vs 5 successes over
+// 8.5h, first success 5s after the printed reset), so parking short of the
+// reset only burns dispatches. Weekly-class resets sit days out and their
+// walls are intermittent, so a hint beyond this horizon must never set the
+// in-budget delay — it gets the probe cadence below instead.
+export const BOUNDED_TRANSIENT_HEARTBEAT_HINT_HONOR_HORIZON_MS =
+  6 * 60 * 60 * 1000;
+// Probe cadence for a hint beyond the honor horizon. Matches the last entry
+// of the backoff table: the scheduler already tolerates that gap between
+// attempts on its own, so a longer vendor wall gets re-probed once per cap
+// window while the transient retry budget lasts.
 export const BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS =
   2 * 60 * 60 * 1000;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
@@ -883,6 +890,17 @@ function readTransientRetryNotBeforeFromRun(
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+// True only when the writer of the retry-not-before stamp attested that it
+// was parsed out of a real vendor error (adapter parse, or the recovery
+// classifier's clock-reset parse). Synthetic stamps — e.g. the recovery
+// classifier's fixed default backoff when nothing parseable exists — carry
+// `false`, and stamps persisted before the flag existed read as unproven.
+function readTransientRetryResetTimeParsedFromRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">,
+) {
+  return parseObject(run.resultJson).transientRetryResetTimeParsed === true;
+}
+
 function readTransientRecoveryContractFromRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
@@ -892,6 +910,7 @@ function readTransientRecoveryContractFromRun(
     ? {
         errorFamily,
         retryNotBefore: readTransientRetryNotBeforeFromRun(run),
+        resetTimeParsed: readTransientRetryResetTimeParsedFromRun(run),
       }
     : null;
 }
@@ -988,6 +1007,10 @@ function mergeAdapterRecoveryMetadata(input: {
       ? {
           retryNotBefore,
           transientRetryNotBefore: retryNotBefore,
+          // An adapter-reported retry-not-before is a parse of the vendor's
+          // own error by construction — this function only fires on values
+          // the adapter extracted and reported.
+          transientRetryResetTimeParsed: true,
           ...(errorFamily === "provider_quota"
             ? { providerQuotaRetryNotBefore: retryNotBefore }
             : {}),
@@ -13518,42 +13541,48 @@ export function heartbeatService(
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
+    const transientRetryResetTimeParsed =
+      transientRecovery?.resetTimeParsed ?? false;
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
 
     // A provider-printed reset hint that is still in the future explains the
-    // failure: the vendor has promised recovery at a known instant, so
-    // spending the unexplained-failure budget must never abandon the run
-    // while that promise is live — before the cap existed, such a wall
-    // self-healed at the printed reset. Keep re-probing once per cap window
-    // until the hint passes; only unexplained failures (no hint, or a hint
-    // already in the past) exhaust terminally.
+    // failure only for part of the channel: an adapter-parsed (or recovery-
+    // classifier-parsed) stamp really is the vendor promising recovery at a
+    // known instant, but the same resultJson keys also carried synthetic
+    // default-backoff stamps that promise nothing (ALM-7596 B1-r2). So the
+    // budget must not abandon a run while a PROVEN promise is live — and
+    // must not probe forever either. The post-budget allowance is exactly
+    // one final park AT the printed reset (the promise as last resort, not a
+    // probe treadmill), taken only when the stamp's writer attested a real
+    // parse. The next failure after that park exhausts terminally, as does
+    // any hint that is unproven, absent, or already in the past.
     const liveTransientResetHint =
       transientRetryNotBefore &&
       transientRetryNotBefore.getTime() > now.getTime()
         ? transientRetryNotBefore
         : null;
-    const hintProbeDelayMs =
-      !baseSchedule && liveTransientResetHint
+    const finalHintParkDelayMs =
+      !baseSchedule &&
+      liveTransientResetHint &&
+      transientRetryResetTimeParsed &&
+      nextAttempt === maxAttempts + 1
         ? Math.max(
             1_000,
-            Math.min(
-              liveTransientResetHint.getTime() - now.getTime(),
-              BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS,
-            ),
+            liveTransientResetHint.getTime() - now.getTime(),
           )
         : null;
-    const hintProbeSchedule =
-      hintProbeDelayMs !== null
+    const finalHintParkSchedule =
+      finalHintParkDelayMs !== null
         ? {
             attempt: nextAttempt,
-            baseDelayMs: BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS,
-            delayMs: hintProbeDelayMs,
-            dueAt: new Date(now.getTime() + hintProbeDelayMs),
+            baseDelayMs: finalHintParkDelayMs,
+            delayMs: finalHintParkDelayMs,
+            dueAt: new Date(now.getTime() + finalHintParkDelayMs),
             maxAttempts,
           }
         : null;
-    const effectiveBaseSchedule = baseSchedule ?? hintProbeSchedule;
+    const effectiveBaseSchedule = baseSchedule ?? finalHintParkSchedule;
 
     if (!effectiveBaseSchedule) {
       await appendRunEvent(run, {
@@ -13571,6 +13600,7 @@ export function heartbeatService(
           issueId,
           transientRetryNotBefore:
             transientRetryNotBefore?.toISOString() ?? null,
+          transientRetryResetTimeParsed,
         },
       });
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
@@ -13596,12 +13626,12 @@ export function heartbeatService(
       };
     }
 
-    if (hintProbeSchedule) {
+    if (finalHintParkSchedule) {
       await appendRunEvent(run, {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: `Bounded retry budget exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts, but the provider reset hint is still ahead; re-probing once per deferral-cap window instead of abandoning the run`,
+        message: `Bounded retry budget exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts, but a parsed provider reset hint is still ahead; taking one final park at the printed reset instead of abandoning the run`,
         payload: {
           retryReason,
           scheduledRetryAttempt: nextAttempt,
@@ -13609,7 +13639,7 @@ export function heartbeatService(
           issueId,
           transientRetryNotBefore:
             liveTransientResetHint?.toISOString() ?? null,
-          scheduledRetryAt: hintProbeSchedule.dueAt.toISOString(),
+          scheduledRetryAt: finalHintParkSchedule.dueAt.toISOString(),
         },
       });
     }
@@ -13645,11 +13675,20 @@ export function heartbeatService(
     const providerDeferralCapAt = new Date(
       now.getTime() + BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS,
     );
+    const hintHonorHorizonAt = new Date(
+      now.getTime() + BOUNDED_TRANSIENT_HEARTBEAT_HINT_HONOR_HORIZON_MS,
+    );
     // Explicit boolean rather than reference identity, so the signal survives
     // a refactor that rebuilds the Date object in either branch.
+    // A hint at or inside the honor horizon is honoured exactly (session-
+    // class walls are near-total; parking short of the printed reset only
+    // burns dispatches). Only a hint beyond the horizon is capped down to
+    // the probe cadence. The final post-budget park is naturally exempt:
+    // its dueAt is the printed reset itself, later than the capped instant,
+    // so the later-wins selection below keeps it.
     const transientRetryDeferralWasCapped =
       transientRetryNotBefore != null &&
-      transientRetryNotBefore.getTime() > providerDeferralCapAt.getTime();
+      transientRetryNotBefore.getTime() > hintHonorHorizonAt.getTime();
     const cappedTransientRetryNotBefore = transientRetryDeferralWasCapped
       ? providerDeferralCapAt
       : transientRetryNotBefore;
