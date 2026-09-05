@@ -1854,6 +1854,44 @@ async function assertCanManageIssueMonitor(
   throw forbidden("Only the assignee agent or a board user can manage issue monitors");
 }
 
+/**
+ * Guard for `POST /issues/:id/scheduled-retry/retry-now`.
+ *
+ * Deliberately the *disjunction* of the three principals that may accelerate an
+ * already-queued retry, where `assertCanManageIssueMonitor` above is a
+ * conjunction:
+ *
+ *   board  OR  the issue's assignee agent  OR  company-scope `runtime:manage`
+ *
+ * Retry-now was board-only, which made a mis-parked retry unrecoverable by the
+ * fleet: the assignee whose retry is parked is by construction the agent that
+ * is walled or paused, so an assignee-only rule cannot clear the case it exists
+ * for. `runtime:manage` already confers agent pause/resume, so moving an
+ * existing scheduled retry earlier under it is strictly less power. The
+ * `runtime:manage` disjunct is what excludes low-trust review agents, task
+ * bridge keys and skill-test tokens, all of which are denied that action.
+ *
+ * This never creates or reschedules work: `retryScheduledRetryNow` only
+ * promotes a retry that is already in `scheduled_retry`, and stamps the
+ * requesting actor onto the run context, the run event and the activity log.
+ */
+async function assertCanTriggerScheduledRetryNow(
+  accessSvc: ReturnType<typeof accessService>,
+  req: Request,
+  companyId: string,
+  assigneeAgentId: string | null,
+) {
+  if (req.actor.type === "board") return;
+  if (req.actor.type === "agent" && req.actor.agentId && req.actor.agentId === assigneeAgentId) return;
+  const runtimeDecision = await accessSvc.decide({
+    actor: req.actor,
+    action: "runtime:manage",
+    resource: { type: "company", companyId },
+  });
+  if (runtimeDecision.allowed) return;
+  throw forbidden(runtimeDecision.explanation, authorizationDeniedDetails(runtimeDecision));
+}
+
 function summarizeIssueMonitor(
   issue: {
     monitorNextCheckAt?: Date | null;
@@ -9770,10 +9808,10 @@ export function issueRoutes(
   });
 
   router.post("/issues/:id/scheduled-retry/retry-now", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
+    await assertCanTriggerScheduledRetryNow(access, req, issue.companyId, issue.assigneeAgentId);
 
     const actor = getActorInfo(req);
     const result = await heartbeat.retryScheduledRetryNow({

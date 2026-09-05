@@ -93,6 +93,64 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     };
   }
 
+  // An agent JWT whose agentId never resolved. It must not slip through the
+  // assignee disjunct by matching a null assigneeAgentId.
+  function anonymousAgentActor(companyId: string): Express.Request["actor"] {
+    return {
+      type: "agent",
+      companyId,
+      runId: randomUUID(),
+      source: "agent_jwt",
+    };
+  }
+
+  // A board key that clears assertCompanyAccess (companyIds match, no
+  // memberships array to check) but owns no DB membership row, so
+  // `runtime:manage` is denied for it. This is the actor that proves the board
+  // disjunct carries its own weight rather than riding on runtime:manage.
+  function boardKeyActorWithoutMembershipRow(companyId: string): Express.Request["actor"] {
+    return {
+      type: "board",
+      userId: `board-key-${randomUUID()}`,
+      companyIds: [companyId],
+      isInstanceAdmin: false,
+      source: "board_key",
+    };
+  }
+
+  function lowTrustPermissions(issueId: string) {
+    return {
+      trustPreset: "low_trust_review",
+      authorizationPolicy: {
+        trustBoundary: {
+          mode: "low_trust_review",
+          issueIds: [issueId],
+        },
+      },
+    };
+  }
+
+  async function seedPeerAgent(companyId: string, permissions: Record<string, unknown>) {
+    const peerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: peerAgentId,
+      companyId,
+      name: `Peer-${peerAgentId.slice(0, 8)}`,
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions,
+    });
+    return peerAgentId;
+  }
+
   async function seedIssueWithRetry(input: {
     agentStatus?: "active" | "paused";
     retryStatus?: "scheduled_retry" | "queued" | "running";
@@ -407,14 +465,134 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     });
   });
 
-  it("requires board access for retry-now", async () => {
-    const { companyId, agentId, issueId } = await seedIssueWithRetry();
+  // retry-now authorization is the disjunction
+  //   board OR the assignee agent OR company-scope `runtime:manage`
+  // Each `it` below is the negative fixture for exactly one disjunct: delete
+  // that disjunct from assertCanTriggerScheduledRetryNow and only that test
+  // goes red.
+
+  it("promotes for a board actor that is denied runtime:manage", async () => {
+    const { companyId, issueId, retryRunId } = await seedIssueWithRetry();
+
+    const res = await request(createApp(boardKeyActorWithoutMembershipRow(companyId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.outcome).toBe("promoted");
+    expect(res.body.scheduledRetry.runId).toBe(retryRunId);
+  });
+
+  it("promotes for the assignee agent even when it is denied runtime:manage", async () => {
+    const { companyId, agentId, issueId, retryRunId } = await seedIssueWithRetry();
+    await db
+      .update(agents)
+      .set({ permissions: lowTrustPermissions(issueId) })
+      .where(eq(agents.id, agentId));
 
     const res = await request(createApp(agentActor(companyId, agentId)))
       .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
       .send({});
 
-    expect(res.status).toBe(403);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.outcome).toBe("promoted");
+    expect(res.body.scheduledRetry.runId).toBe(retryRunId);
+  });
+
+  it("promotes for a non-assignee agent that holds company-scope runtime:manage", async () => {
+    const { companyId, issueId, retryRunId } = await seedIssueWithRetry();
+    const peerAgentId = await seedPeerAgent(companyId, {});
+
+    const res = await request(createApp(agentActor(companyId, peerAgentId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.outcome).toBe("promoted");
+    expect(res.body.scheduledRetry.runId).toBe(retryRunId);
+  });
+
+  it("refuses a non-assignee agent that is denied runtime:manage", async () => {
+    const { companyId, issueId, retryRunId } = await seedIssueWithRetry();
+    const peerAgentId = await seedPeerAgent(companyId, lowTrustPermissions(issueId));
+
+    const res = await request(createApp(agentActor(companyId, peerAgentId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+
+    const [run] = await db
+      .select({ status: heartbeatRuns.status, scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    expect(run.status).toBe("scheduled_retry");
+    expect(run.scheduledRetryAt?.toISOString()).toBe("2026-05-06T19:00:00.000Z");
+
+    const activity = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId));
+    expect(activity).toEqual([]);
+  });
+
+  it("refuses an agent actor with no agent id on an unassigned issue", async () => {
+    const { companyId, issueId } = await seedIssueWithRetry();
+    await db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, issueId));
+
+    const res = await request(createApp(anonymousAgentActor(companyId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+  });
+
+  it("keeps the uniform 404 for a cross-company agent instead of leaking a 403", async () => {
+    const { issueId } = await seedIssueWithRetry();
+    const otherCompanyId = randomUUID();
+
+    const res = await request(createApp(agentActor(otherCompanyId, randomUUID())))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+  });
+
+  it("stamps the promoting agent onto the audit trail", async () => {
+    const { companyId, agentId, issueId, retryRunId } = await seedIssueWithRetry();
+    const peerAgentId = await seedPeerAgent(companyId, {});
+
+    const res = await request(createApp(agentActor(companyId, peerAgentId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const [activity] = await db
+      .select({
+        action: activityLog.action,
+        actorType: activityLog.actorType,
+        actorId: activityLog.actorId,
+        entityId: activityLog.entityId,
+        agentId: activityLog.agentId,
+      })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId));
+    expect(activity).toEqual({
+      action: "issue.scheduled_retry_retry_now",
+      actorType: "agent",
+      actorId: peerAgentId,
+      entityId: issueId,
+      agentId,
+    });
+
+    const [run] = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    const snapshot = run.contextSnapshot as Record<string, unknown>;
+    expect(snapshot.retryNowRequestedByActorType).toBe("agent");
+    expect(snapshot.retryNowRequestedByActorId).toBe(peerAgentId);
   });
 
   it("enforces company scoping for retry-now with a uniform 404", async () => {
