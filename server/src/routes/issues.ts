@@ -1867,13 +1867,20 @@ async function assertCanManageIssueMonitor(
  * fleet: the assignee whose retry is parked is by construction the agent that
  * is walled or paused, so an assignee-only rule cannot clear the case it exists
  * for. `runtime:manage` already confers agent pause/resume, so moving an
- * existing scheduled retry earlier under it is strictly less power. The
- * `runtime:manage` disjunct is what excludes low-trust review agents, task
- * bridge keys and skill-test tokens, all of which are denied that action.
+ * existing scheduled retry earlier under it is strictly less power.
  *
- * This never creates or reschedules work: `retryScheduledRetryNow` only
- * promotes a retry that is already in `scheduled_retry`, and stamps the
- * requesting actor onto the run context, the run event and the activity log.
+ * The `runtime:manage` disjunct denies low-trust review agents, task bridge
+ * keys and skill-test tokens — but only when they are *not* the assignee. The
+ * assignee disjunct returns before `decide()` is ever called, so a restricted
+ * key scoped to the assignee never meets its own deny list. That is faithful to
+ * the ruling, which put no trust qualifier on the assignee disjunct, and the
+ * blast radius is its own agent's already-queued retry. Fixtures CTO-1..CTO-4
+ * in `issue-scheduled-retry-routes.test.ts` pin both halves.
+ *
+ * This never creates, reschedules or destroys work: `retryScheduledRetryNow`
+ * only promotes a retry that is already in `scheduled_retry`, leaves it parked
+ * when the promotion gate would suppress it, and stamps the requesting actor
+ * onto the run context, the run event and the activity log.
  */
 async function assertCanTriggerScheduledRetryNow(
   accessSvc: ReturnType<typeof accessService>,

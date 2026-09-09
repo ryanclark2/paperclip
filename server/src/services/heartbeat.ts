@@ -13342,10 +13342,7 @@ export function heartbeatService(
     return cancelled;
   }
 
-  async function promoteScheduledRetryRun(
-    dueRun: typeof heartbeatRuns.$inferSelect,
-    now: Date,
-  ): Promise<
+  type ScheduledRetryPromotion =
     | { outcome: "promoted"; run: typeof heartbeatRuns.$inferSelect }
     | {
         outcome: "gate_suppressed";
@@ -13353,57 +13350,111 @@ export function heartbeatService(
         reason: string;
         errorCode: BlockedScheduledRetryGate["errorCode"];
       }
-    | { outcome: "not_promoted"; run: typeof heartbeatRuns.$inferSelect | null }
-  > {
-    const agent = await getAgent(dueRun.agentId);
+    | { outcome: "not_promoted"; run: typeof heartbeatRuns.$inferSelect | null };
+
+  /**
+   * The gate blocking promotion of `run`, or null when promotion may proceed.
+   *
+   * Shared by `promoteScheduledRetryRun` and the retry-now pre-flight so the
+   * two cannot drift. A retry-now caller must be refused by exactly the gate
+   * that would have stopped the promotion — including the legacy `issue_not_found`
+   * carve-out below, which is a *pass*, not a block.
+   */
+  async function blockingScheduledRetryGate(
+    run: typeof heartbeatRuns.$inferSelect,
+  ): Promise<Extract<ScheduledRetryGate, { allowed: false }> | null> {
+    const agent = await getAgent(run.agentId);
     if (!agent) {
-      const gate = {
-        allowed: false as const,
+      return {
+        allowed: false,
         reason: "Scheduled retry suppressed because the agent no longer exists",
-        errorCode: "agent_not_invokable" as const,
-        issueId: readNonEmptyString(
-          parseObject(dueRun.contextSnapshot).issueId,
-        ),
-        details: { agentId: dueRun.agentId },
+        errorCode: "agent_not_invokable",
+        issueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
+        details: { agentId: run.agentId },
       };
-      const cancelled = await cancelScheduledRetryForGate(dueRun, gate, now);
-      return cancelled
-        ? {
-            outcome: "gate_suppressed",
-            run: cancelled,
-            reason: gate.reason,
-            errorCode: gate.errorCode,
-          }
-        : { outcome: "not_promoted", run: null };
     }
 
-    const contextSnapshot = parseObject(dueRun.contextSnapshot);
     const gate = await evaluateScheduledRetryGate({
-      run: dueRun,
+      run,
       agent,
-      contextSnapshot,
-      retryReason: dueRun.scheduledRetryReason,
+      contextSnapshot: parseObject(run.contextSnapshot),
+      retryReason: run.scheduledRetryReason,
       enforceIssueExecutionLock:
-        dueRun.scheduledRetryReason === MAX_TURN_CONTINUATION_RETRY_REASON,
+        run.scheduledRetryReason === MAX_TURN_CONTINUATION_RETRY_REASON,
     });
-    if (!gate.allowed) {
-      if (
-        gate.errorCode === "issue_not_found" &&
-        dueRun.scheduledRetryReason !== MAX_TURN_CONTINUATION_RETRY_REASON
-      ) {
-        // Preserve legacy transient retry behavior for runs that only carry a
-        // loose task context rather than a persisted issue row.
-      } else {
-        const cancelled = await cancelScheduledRetryForGate(dueRun, gate, now);
-        return cancelled
-          ? {
-              outcome: "gate_suppressed",
-              run: cancelled,
-              reason: gate.reason,
-              errorCode: gate.errorCode,
-            }
-          : { outcome: "not_promoted", run: null };
-      }
+    if (gate.allowed) return null;
+
+    if (
+      gate.errorCode === "issue_not_found" &&
+      run.scheduledRetryReason !== MAX_TURN_CONTINUATION_RETRY_REASON
+    ) {
+      // Preserve legacy transient retry behavior for runs that only carry a
+      // loose task context rather than a persisted issue row.
+      return null;
+    }
+
+    return gate;
+  }
+
+  /**
+   * Resolve a suppressing gate into a promotion outcome.
+   *
+   * The single place that decides whether suppression *destroys* the parked
+   * retry. Keep it that way: both of `promoteScheduledRetryRun`'s suppression
+   * sites route through here, so the destructive arm cannot be re-added on one
+   * of them alone.
+   */
+  async function suppressScheduledRetryForGate(
+    run: typeof heartbeatRuns.$inferSelect,
+    gate: Extract<ScheduledRetryGate, { allowed: false }>,
+    now: Date,
+    cancelOnGateSuppression: boolean,
+  ): Promise<ScheduledRetryPromotion> {
+    if (!cancelOnGateSuppression) {
+      return {
+        outcome: "gate_suppressed",
+        run,
+        reason: gate.reason,
+        errorCode: gate.errorCode,
+      };
+    }
+    const cancelled = await cancelScheduledRetryForGate(run, gate, now);
+    return cancelled
+      ? {
+          outcome: "gate_suppressed",
+          run: cancelled,
+          reason: gate.reason,
+          errorCode: gate.errorCode,
+        }
+      : { outcome: "not_promoted", run: null };
+  }
+
+  /**
+   * Promote a due `scheduled_retry` run into the queued pool.
+   *
+   * `cancelOnGateSuppression` decides what a suppressing gate does to the
+   * parked retry. The scheduler passes `true` (the default): the retry's time
+   * came, the agent cannot run, so the retry is spent and gets cancelled.
+   *
+   * The retry-now accelerator passes `false`. Nothing there is "spent" — the
+   * caller only asked for the retry to run *earlier*, and no route re-arms a
+   * `scheduled_retry` run once it is cancelled, so cancelling on that path
+   * destroys state that only the board can hand-repair. See
+   * `retryScheduledRetryNow`.
+   */
+  async function promoteScheduledRetryRun(
+    dueRun: typeof heartbeatRuns.$inferSelect,
+    now: Date,
+    options: { cancelOnGateSuppression?: boolean } = {},
+  ): Promise<ScheduledRetryPromotion> {
+    const gate = await blockingScheduledRetryGate(dueRun);
+    if (gate) {
+      return suppressScheduledRetryForGate(
+        dueRun,
+        gate,
+        now,
+        options.cancelOnGateSuppression ?? true,
+      );
     }
 
     const promoted = await db
@@ -14552,6 +14603,69 @@ export function heartbeatService(
     };
   }
 
+  /**
+   * Undo the dueness that retry-now manufactured, putting `accelerated` back on
+   * its original schedule.
+   *
+   * Only reachable when the promotion gate closed between the retry-now
+   * pre-flight and the promote itself. The retry-now audit stamps stay on the
+   * context snapshot — someone did ask — but `scheduledRetryAt` must go back,
+   * or the run sits due-and-suppressing and the scheduler cancels it on the
+   * next tick.
+   */
+  async function restoreParkedScheduledRetry(
+    accelerated: typeof heartbeatRuns.$inferSelect,
+    original: typeof heartbeatRuns.$inferSelect,
+    now: Date,
+  ) {
+    const originalRetryAt = original.scheduledRetryAt
+      ? new Date(original.scheduledRetryAt)
+      : null;
+    const originalRetryAtIso = originalRetryAt?.toISOString() ?? null;
+
+    return db.transaction(async (tx) => {
+      const row = await tx
+        .update(heartbeatRuns)
+        .set({
+          scheduledRetryAt: originalRetryAt,
+          contextSnapshot: {
+            ...parseObject(accelerated.contextSnapshot),
+            scheduledRetryAt: originalRetryAtIso,
+            retryNowSuppressedAt: now.toISOString(),
+          },
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.id, accelerated.id),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+          ),
+        )
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!row) return null;
+
+      if (row.wakeupRequestId) {
+        const payload = parseObject(
+          await tx
+            .select({ payload: agentWakeupRequests.payload })
+            .from(agentWakeupRequests)
+            .where(eq(agentWakeupRequests.id, row.wakeupRequestId))
+            .then((rows) => rows[0]?.payload ?? null),
+        );
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            payload: { ...payload, scheduledRetryAt: originalRetryAtIso },
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, row.wakeupRequestId));
+      }
+
+      return row;
+    });
+  }
+
   async function retryScheduledRetryNow(input: {
     issueId: string;
     actor?: {
@@ -14588,6 +14702,25 @@ export function heartbeatService(
         outcome: "no_scheduled_retry" as const,
         message: "No live scheduled retry exists for this issue",
         scheduledRetry: null,
+      };
+    }
+
+    // Evaluate the promotion gate *before* manufacturing dueness.
+    //
+    // Retry-now accelerates a retry by rewriting `scheduledRetryAt` to now.
+    // That write is what makes the run eligible for cancellation, because both
+    // `cancelScheduledRetryForGate` and the promote itself are guarded on
+    // `scheduledRetryAt <= now`. Evaluating the gate first means the steady
+    // suppressing case — a paused, walled or over-budget assignee, which is
+    // precisely the population whose retries are parked — leaves the retry
+    // untouched at its original time and performs no write at all.
+    const preflight = await blockingScheduledRetryGate(scheduled.run);
+    if (preflight) {
+      return {
+        outcome: "gate_suppressed" as const,
+        message: preflight.reason,
+        suppressedErrorCode: preflight.errorCode,
+        scheduledRetry: summarizeIssueScheduledRetryRun(scheduled),
       };
     }
 
@@ -14678,7 +14811,32 @@ export function heartbeatService(
       },
     });
 
-    const promotion = await promoteScheduledRetryRun(updated, now);
+    // `cancelOnGateSuppression: false` is what keeps this verb non-destructive.
+    // The pre-flight above already refused the steady suppressing case, so
+    // reaching suppression here means the gate closed between the two reads.
+    // Restore the park rather than cancelling it, otherwise the retry is left
+    // due-and-suppressing and the next scheduler tick finishes the job.
+    const promotion = await promoteScheduledRetryRun(updated, now, {
+      cancelOnGateSuppression: false,
+    });
+
+    if (promotion.outcome === "gate_suppressed") {
+      const restored = await restoreParkedScheduledRetry(
+        updated,
+        scheduled.run,
+        now,
+      );
+      return {
+        outcome: "gate_suppressed" as const,
+        message: promotion.reason,
+        suppressedErrorCode: promotion.errorCode,
+        scheduledRetry: summarizeIssueScheduledRetryRun({
+          run: restored ?? updated,
+          agentName: scheduled.agentName,
+        }),
+      };
+    }
+
     const promotedRow = await getIssueRetryRun(issue.companyId, issue.id, [
       "queued",
       "running",
@@ -14695,13 +14853,6 @@ export function heartbeatService(
       return {
         outcome: "promoted" as const,
         message: "Scheduled retry was promoted to the queued run pool",
-        scheduledRetry,
-      };
-    }
-    if (promotion.outcome === "gate_suppressed") {
-      return {
-        outcome: "gate_suppressed" as const,
-        message: promotion.reason,
         scheduledRetry,
       };
     }

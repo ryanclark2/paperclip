@@ -621,6 +621,13 @@ export interface IssueRetryNowResponse {
   outcome: IssueRetryNowOutcome;
   message: string;
   scheduledRetry: IssueScheduledRetry | null;
+  /**
+   * Machine-readable gate reason on a `gate_suppressed` outcome, absent
+   * otherwise. Retry-now leaves a suppressed retry parked rather than
+   * cancelling it, so `scheduledRetry.errorCode` stays null and this carries
+   * the reason instead.
+   */
+  suppressedErrorCode?: string | null;
 }
 
 export interface IssueRelation {

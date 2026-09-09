@@ -118,6 +118,43 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     };
   }
 
+  // A restricted agent key: the scope, not the agent's permissions, is what
+  // denies `runtime:manage`. CTO-1..CTO-4 below use these to pin that the
+  // restriction only bites a *non-assignee* caller — the assignee disjunct
+  // returns before `decide()` runs, so an assignee-scoped restricted key never
+  // meets its own deny list. See the guard comment in `routes/issues.ts`.
+  function taskBridgeAgentActor(
+    companyId: string,
+    agentId: string,
+    parentIssueId: string,
+  ): Express.Request["actor"] {
+    return {
+      type: "agent",
+      agentId,
+      companyId,
+      runId: randomUUID(),
+      source: "agent_jwt",
+      keyId: randomUUID(),
+      keyScope: { kind: "task_bridge", parentIssueId },
+    } as Express.Request["actor"];
+  }
+
+  function skillTestAgentActor(
+    companyId: string,
+    agentId: string,
+    issueId: string,
+  ): Express.Request["actor"] {
+    return {
+      type: "agent",
+      agentId,
+      companyId,
+      runId: randomUUID(),
+      source: "agent_jwt",
+      keyId: randomUUID(),
+      keyScope: { kind: "skill_test", issueId },
+    } as Express.Request["actor"];
+  }
+
   function lowTrustPermissions(issueId: string) {
     return {
       trustPreset: "low_trust_review",
@@ -419,28 +456,46 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toMatchObject({
       outcome: "gate_suppressed",
+      suppressedErrorCode: "agent_not_invokable",
       scheduledRetry: {
         runId: retryRunId,
-        status: "cancelled",
-        errorCode: "agent_not_invokable",
+        // Still parked, at its ORIGINAL time. Retry-now must not manufacture
+        // dueness for a retry the gate would refuse: no route re-arms a
+        // cancelled `scheduled_retry`, so cancelling here would destroy state
+        // only the board can hand-repair (ALM-7934).
+        status: "scheduled_retry",
+        errorCode: null,
+        scheduledRetryAt: "2026-05-06T19:00:00.000Z",
       },
     });
 
     const [run] = await db
-      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .select({
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+      })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, retryRunId));
-    expect(run).toEqual({ status: "cancelled", errorCode: "agent_not_invokable" });
+    expect(run).toEqual({
+      status: "scheduled_retry",
+      errorCode: null,
+      scheduledRetryAt: new Date("2026-05-06T19:00:00.000Z"),
+    });
 
-    const [activity] = await db
+    // Whole array, not `const [activity]`: pinning the first row lets a mutant
+    // that writes a second activity row survive.
+    const activity = await db
       .select({ action: activityLog.action, entityId: activityLog.entityId, runId: activityLog.runId })
       .from(activityLog)
       .where(eq(activityLog.entityId, issueId));
-    expect(activity).toEqual({
-      action: "issue.scheduled_retry_retry_now",
-      entityId: issueId,
-      runId: retryRunId,
-    });
+    expect(activity).toEqual([
+      {
+        action: "issue.scheduled_retry_retry_now",
+        entityId: issueId,
+        runId: retryRunId,
+      },
+    ]);
   });
 
   it("does not promote a scheduled retry after on-demand wakes are disabled", async () => {
@@ -457,10 +512,16 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toMatchObject({
       outcome: "gate_suppressed",
+      suppressedErrorCode: "heartbeat_wake_on_demand_disabled",
       scheduledRetry: {
         runId: retryRunId,
-        status: "cancelled",
-        errorCode: "heartbeat_wake_on_demand_disabled",
+        // Still parked, at its ORIGINAL time. Retry-now must not manufacture
+        // dueness for a retry the gate would refuse: no route re-arms a
+        // cancelled `scheduled_retry`, so cancelling here would destroy state
+        // only the board can hand-repair (ALM-7934).
+        status: "scheduled_retry",
+        errorCode: null,
+        scheduledRetryAt: "2026-05-06T19:00:00.000Z",
       },
     });
   });
@@ -551,19 +612,43 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
       .send({});
 
-    // Widening the guard must not widen what gets promoted. Note the gate is
-    // destructive for every caller: a suppressed retry is cancelled, not left
-    // parked, so calling this during the wall that caused the park destroys
-    // the retry. Pre-existing behaviour, but agents can now reach it.
+    // Widening the guard must not widen what gets promoted — and must not let
+    // an agent destroy the retry it is trying to help. The assignee is paused,
+    // which is exactly the population whose retries are parked, so the caller
+    // is refused and the retry is left exactly as it was.
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.outcome).toBe("gate_suppressed");
 
     const [run] = await db
-      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .select({
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+      })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, retryRunId));
-    expect(run).toEqual({ status: "cancelled", errorCode: "agent_not_invokable" });
+    expect(run).toEqual({
+      status: "scheduled_retry",
+      errorCode: null,
+      scheduledRetryAt: new Date("2026-05-06T19:00:00.000Z"),
+    });
     expect(peerAgentId).not.toBe(agentId);
+
+    // The park survives a *second* caller too: a fleet sweep across parked
+    // retries must be idempotent, not cumulative.
+    const second = await request(createApp(agentActor(companyId, peerAgentId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+    expect(second.status, JSON.stringify(second.body)).toBe(200);
+    expect(second.body.outcome).toBe("gate_suppressed");
+    const [afterSweep] = await db
+      .select({ status: heartbeatRuns.status, scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    expect(afterSweep).toEqual({
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date("2026-05-06T19:00:00.000Z"),
+    });
   });
 
   it("refuses an agent actor with no agent id on an unassigned issue", async () => {
@@ -575,6 +660,86 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       .send({});
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
+  });
+
+  // CTO-1..CTO-4 (ALM-7900 finding N1). The `runtime:manage` disjunct denies
+  // restricted keys, but only for non-assignee callers. Both halves are pinned
+  // so the guard's doc comment cannot drift back to overclaiming.
+
+  it("CTO-1: refuses a non-assignee task-bridge key", async () => {
+    const { companyId, issueId, retryRunId } = await seedIssueWithRetry();
+    const peerAgentId = await seedPeerAgent(companyId, {});
+
+    const res = await request(createApp(taskBridgeAgentActor(companyId, peerAgentId, issueId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toEqual({
+      error: "Task bridge keys cannot use company-wide, peer-agent, project, runtime, or secret APIs.",
+      details: { reason: "deny_scope" },
+    });
+
+    const [run] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    expect(run.status).toBe("scheduled_retry");
+  });
+
+  it("CTO-2: admits an assignee task-bridge key, because the assignee disjunct returns first", async () => {
+    const { companyId, agentId, issueId, retryRunId } = await seedIssueWithRetry();
+
+    const res = await request(createApp(taskBridgeAgentActor(companyId, agentId, issueId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.outcome).toBe("promoted");
+
+    const [run] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    expect(run.status).toBe("queued");
+  });
+
+  it("CTO-3: refuses a non-assignee skill-test token", async () => {
+    const { companyId, issueId, retryRunId } = await seedIssueWithRetry();
+    const peerAgentId = await seedPeerAgent(companyId, {});
+
+    const res = await request(createApp(skillTestAgentActor(companyId, peerAgentId, issueId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toEqual({
+      error: "Skill-test run tokens cannot use company-wide, peer-agent, project, runtime, secret, or task-create APIs.",
+      details: { reason: "deny_scope" },
+    });
+
+    const [run] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    expect(run.status).toBe("scheduled_retry");
+  });
+
+  it("CTO-4: admits an assignee skill-test token, because the assignee disjunct returns first", async () => {
+    const { companyId, agentId, issueId, retryRunId } = await seedIssueWithRetry();
+
+    const res = await request(createApp(skillTestAgentActor(companyId, agentId, issueId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.outcome).toBe("promoted");
+
+    const [run] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    expect(run.status).toBe("queued");
   });
 
   it("keeps the uniform 404 for a cross-company agent instead of leaking a 403", async () => {
@@ -598,7 +763,9 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
 
-    const [activity] = await db
+    // Whole array, not `const [activity]`: pinning the first row lets a mutant
+    // that writes a second activity row survive.
+    const activity = await db
       .select({
         action: activityLog.action,
         actorType: activityLog.actorType,
@@ -608,13 +775,15 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       })
       .from(activityLog)
       .where(eq(activityLog.entityId, issueId));
-    expect(activity).toEqual({
-      action: "issue.scheduled_retry_retry_now",
-      actorType: "agent",
-      actorId: peerAgentId,
-      entityId: issueId,
-      agentId,
-    });
+    expect(activity).toEqual([
+      {
+        action: "issue.scheduled_retry_retry_now",
+        actorType: "agent",
+        actorId: peerAgentId,
+        entityId: issueId,
+        agentId,
+      },
+    ]);
 
     const [run] = await db
       .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
@@ -649,10 +818,16 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toMatchObject({
       outcome: "gate_suppressed",
+      suppressedErrorCode: "budget_blocked",
       scheduledRetry: {
         runId: retryRunId,
-        status: "cancelled",
-        errorCode: "budget_blocked",
+        // Still parked, at its ORIGINAL time. Retry-now must not manufacture
+        // dueness for a retry the gate would refuse: no route re-arms a
+        // cancelled `scheduled_retry`, so cancelling here would destroy state
+        // only the board can hand-repair (ALM-7934).
+        status: "scheduled_retry",
+        errorCode: null,
+        scheduledRetryAt: "2026-05-06T19:00:00.000Z",
       },
     });
   });
@@ -702,10 +877,16 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toMatchObject({
       outcome: "gate_suppressed",
+      suppressedErrorCode: "issue_review_participant_changed",
       scheduledRetry: {
         runId: retryRunId,
-        status: "cancelled",
-        errorCode: "issue_review_participant_changed",
+        // Still parked, at its ORIGINAL time. Retry-now must not manufacture
+        // dueness for a retry the gate would refuse: no route re-arms a
+        // cancelled `scheduled_retry`, so cancelling here would destroy state
+        // only the board can hand-repair (ALM-7934).
+        status: "scheduled_retry",
+        errorCode: null,
+        scheduledRetryAt: "2026-05-06T19:00:00.000Z",
       },
     });
   });
@@ -728,10 +909,16 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toMatchObject({
       outcome: "gate_suppressed",
+      suppressedErrorCode: "issue_paused",
       scheduledRetry: {
         runId: retryRunId,
-        status: "cancelled",
-        errorCode: "issue_paused",
+        // Still parked, at its ORIGINAL time. Retry-now must not manufacture
+        // dueness for a retry the gate would refuse: no route re-arms a
+        // cancelled `scheduled_retry`, so cancelling here would destroy state
+        // only the board can hand-repair (ALM-7934).
+        status: "scheduled_retry",
+        errorCode: null,
+        scheduledRetryAt: "2026-05-06T19:00:00.000Z",
       },
     });
   });
@@ -767,10 +954,16 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toMatchObject({
       outcome: "gate_suppressed",
+      suppressedErrorCode: "issue_dependencies_blocked",
       scheduledRetry: {
         runId: retryRunId,
-        status: "cancelled",
-        errorCode: "issue_dependencies_blocked",
+        // Still parked, at its ORIGINAL time. Retry-now must not manufacture
+        // dueness for a retry the gate would refuse: no route re-arms a
+        // cancelled `scheduled_retry`, so cancelling here would destroy state
+        // only the board can hand-repair (ALM-7934).
+        status: "scheduled_retry",
+        errorCode: null,
+        scheduledRetryAt: "2026-05-06T19:00:00.000Z",
       },
     });
   });
@@ -785,10 +978,16 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toMatchObject({
       outcome: "gate_suppressed",
+      suppressedErrorCode: "issue_terminal_status",
       scheduledRetry: {
         runId: retryRunId,
-        status: "cancelled",
-        errorCode: "issue_terminal_status",
+        // Still parked, at its ORIGINAL time. Retry-now must not manufacture
+        // dueness for a retry the gate would refuse: no route re-arms a
+        // cancelled `scheduled_retry`, so cancelling here would destroy state
+        // only the board can hand-repair (ALM-7934).
+        status: "scheduled_retry",
+        errorCode: null,
+        scheduledRetryAt: "2026-05-06T19:00:00.000Z",
       },
     });
   });
