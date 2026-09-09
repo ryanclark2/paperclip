@@ -1,0 +1,274 @@
+import { describe, expect, it } from "vitest";
+import {
+  FALSE_LIVENESS_ERROR_REASON,
+  FALSE_LIVENESS_STREAK_THRESHOLD,
+  falseLivenessStreak,
+  isFalseLivenessRun,
+  reportsZeroProviderUsage,
+  resolveFalseLivenessEscalation,
+  tripsFalseLivenessDetector,
+  type RunUsageSample,
+} from "../services/run-liveness.ts";
+
+// A run whose provider reported nothing: the shape a dead adapter produces.
+// Copied from a real GeminiEng row on 2026-09-01, the episode that ran 63 times
+// before a human noticed.
+const DEAD_USAGE = {
+  model: "google-gemini-cli/gemini-2.5-pro",
+  biller: "google-gemini-cli",
+  provider: "google-gemini-cli",
+  billingType: "unknown",
+  costUsd: 0,
+  inputTokens: 0,
+  outputTokens: 0,
+  rawInputTokens: 0,
+  rawOutputTokens: 0,
+  rawCachedInputTokens: 0,
+  freshSession: true,
+  sessionReused: false,
+};
+
+// FIXTURE 1 (load-bearing). A resumed session reports zero NORMALIZED tokens
+// while the model genuinely ran and billed. Copied from a real CEO row.
+// A detector reading inputTokens/outputTokens marks this agent dead.
+const SESSION_DELTA_USAGE = {
+  costUsd: 0.125663,
+  usageSource: "session_delta",
+  inputTokens: 0,
+  outputTokens: 0,
+  rawInputTokens: 4,
+  rawOutputTokens: 452,
+  rawCachedInputTokens: 200986,
+};
+
+// FIXTURE 2. An ordinary healthy run, non-zero everywhere.
+const HEALTHY_USAGE = {
+  costUsd: 0.3948814,
+  inputTokens: 104000,
+  outputTokens: 6379,
+  rawInputTokens: 104000,
+  rawOutputTokens: 6379,
+  rawCachedInputTokens: 98000,
+};
+
+const dead = (): RunUsageSample => ({
+  status: "succeeded",
+  usageJson: { ...DEAD_USAGE },
+});
+const healthy = (): RunUsageSample => ({
+  status: "succeeded",
+  usageJson: { ...HEALTHY_USAGE },
+});
+const repeat = (n: number, make: () => RunUsageSample) =>
+  Array.from({ length: n }, make);
+
+describe("false-liveness predicate", () => {
+  // FIXTURE 1 — the control the whole change exists to protect.
+  it("does not trip on a session_delta run with zero normalized tokens", () => {
+    expect(reportsZeroProviderUsage(SESSION_DELTA_USAGE)).toBe(false);
+    expect(
+      isFalseLivenessRun({
+        status: "succeeded",
+        usageJson: SESSION_DELTA_USAGE,
+      }),
+    ).toBe(false);
+    // Even an unbroken run of them must never trip the detector.
+    expect(
+      tripsFalseLivenessDetector(
+        repeat(50, () => ({
+          status: "succeeded",
+          usageJson: { ...SESSION_DELTA_USAGE },
+        })),
+      ),
+    ).toBe(false);
+  });
+
+  // FIXTURE 2.
+  it("does not trip on an ordinary healthy run", () => {
+    expect(reportsZeroProviderUsage(HEALTHY_USAGE)).toBe(false);
+    expect(tripsFalseLivenessDetector(repeat(50, healthy))).toBe(false);
+  });
+
+  it("matches a succeeded run whose provider reported zero usage and cost", () => {
+    expect(reportsZeroProviderUsage(DEAD_USAGE)).toBe(true);
+    expect(isFalseLivenessRun(dead())).toBe(true);
+  });
+
+  // Pins each measure INDIVIDUALLY. Dropping any one key from the guard's key
+  // list must be caught, so each key gets a fixture where it alone is non-zero.
+  it.each([
+    ["rawInputTokens", { ...DEAD_USAGE, rawInputTokens: 12 }],
+    ["rawOutputTokens", { ...DEAD_USAGE, rawOutputTokens: 12 }],
+    ["rawCachedInputTokens", { ...DEAD_USAGE, rawCachedInputTokens: 12 }],
+    ["costUsd", { ...DEAD_USAGE, costUsd: 0.0001 }],
+  ])("a non-zero %s alone disqualifies the run", (_key, usageJson) => {
+    expect(reportsZeroProviderUsage(usageJson)).toBe(false);
+  });
+
+  // The normalized counters must have NO influence. Flipping them either way
+  // on an otherwise-dead run must not change the verdict.
+  it.each([
+    ["inputTokens", { ...DEAD_USAGE, inputTokens: 104000 }],
+    ["outputTokens", { ...DEAD_USAGE, outputTokens: 6379 }],
+  ])("a non-zero %s does NOT rescue a zero-raw run", (_key, usageJson) => {
+    expect(reportsZeroProviderUsage(usageJson)).toBe(true);
+  });
+
+  // FIXTURE 7 — stated behaviour, decided on live data rather than left to
+  // coalesce. Absent usage is an instrumentation gap, not proof the model
+  // produced nothing. Over 90 days every zero-usage run on a healthy agent
+  // (27 runs across FoundingEng, AdversarialEng, CTO, CEO, CMO) had a NULL
+  // usage_json, while all 221 on dead agents carried a populated object.
+  it.each([
+    ["null", null],
+    ["undefined", undefined],
+    ["empty object", {}],
+  ])("does NOT match when usageJson is %s", (_label, usageJson) => {
+    expect(reportsZeroProviderUsage(usageJson as never)).toBe(false);
+    expect(
+      tripsFalseLivenessDetector(
+        repeat(50, () => ({
+          status: "succeeded",
+          usageJson: usageJson as never,
+        })),
+      ),
+    ).toBe(false);
+  });
+
+  it("does not match a usage object carrying no measures at all", () => {
+    expect(reportsZeroProviderUsage({ model: "x", biller: "y" })).toBe(false);
+  });
+
+  it("reads numeric strings, and treats malformed values as absent", () => {
+    expect(
+      reportsZeroProviderUsage({ ...DEAD_USAGE, rawOutputTokens: "452" }),
+    ).toBe(false);
+    expect(reportsZeroProviderUsage({ ...DEAD_USAGE, costUsd: "0" })).toBe(true);
+    expect(
+      reportsZeroProviderUsage({ ...DEAD_USAGE, costUsd: Number.NaN }),
+    ).toBe(true);
+  });
+});
+
+describe("false-liveness streak accounting", () => {
+  // FIXTURE 3. A failed run is ignored: it neither trips nor resets.
+  it("ignores non-succeeded runs entirely", () => {
+    for (const status of ["failed", "cancelled", "timed_out"]) {
+      // All-zero usage on a failed run must not count toward the streak.
+      expect(
+        falseLivenessStreak([{ status, usageJson: { ...DEAD_USAGE } }]),
+      ).toBe(0);
+      expect(
+        tripsFalseLivenessDetector(
+          repeat(50, () => ({ status, usageJson: { ...DEAD_USAGE } })),
+        ),
+      ).toBe(false);
+      // ...and must not reset a streak that spans it.
+      expect(
+        falseLivenessStreak([
+          ...repeat(2, dead),
+          { status, usageJson: { ...DEAD_USAGE } },
+          ...repeat(3, dead),
+        ]),
+      ).toBe(FALSE_LIVENESS_STREAK_THRESHOLD);
+    }
+  });
+
+  // FIXTURE 4 — the off-by-one below the threshold.
+  it("does not trip one run short of the threshold", () => {
+    const runs = repeat(FALSE_LIVENESS_STREAK_THRESHOLD - 1, dead);
+    expect(falseLivenessStreak(runs)).toBe(FALSE_LIVENESS_STREAK_THRESHOLD - 1);
+    expect(tripsFalseLivenessDetector(runs)).toBe(false);
+  });
+
+  // FIXTURE 5 — trips at exactly the threshold, and stays tripped after.
+  it("trips at exactly the threshold", () => {
+    const runs = repeat(FALSE_LIVENESS_STREAK_THRESHOLD, dead);
+    expect(falseLivenessStreak(runs)).toBe(FALSE_LIVENESS_STREAK_THRESHOLD);
+    expect(tripsFalseLivenessDetector(runs)).toBe(true);
+    expect(
+      tripsFalseLivenessDetector(repeat(FALSE_LIVENESS_STREAK_THRESHOLD + 1, dead)),
+    ).toBe(true);
+  });
+
+  // FIXTURE 6 — a healthy run resets, so 4 + healthy + 4 must not trip.
+  it("resets the streak on a healthy succeeded run", () => {
+    const runs = [
+      ...repeat(FALSE_LIVENESS_STREAK_THRESHOLD - 1, dead),
+      healthy(),
+      ...repeat(FALSE_LIVENESS_STREAK_THRESHOLD - 1, dead),
+    ];
+    expect(falseLivenessStreak(runs)).toBe(FALSE_LIVENESS_STREAK_THRESHOLD - 1);
+    expect(tripsFalseLivenessDetector(runs)).toBe(false);
+  });
+
+  // The streak is the TRAILING one. A recovered agent whose history still holds
+  // a long dead episode must not be marked on that history.
+  it("counts only the trailing streak, not a historical episode", () => {
+    const runs = [healthy(), ...repeat(63, dead)];
+    expect(falseLivenessStreak(runs)).toBe(0);
+    expect(tripsFalseLivenessDetector(runs)).toBe(false);
+  });
+
+  it("does not trip on an empty history", () => {
+    expect(falseLivenessStreak([])).toBe(0);
+    expect(tripsFalseLivenessDetector([])).toBe(false);
+  });
+
+  // The threshold sits in the measured gap between live and dead agents:
+  // live agents top out at 3 consecutive zero-usage successes, dead episodes
+  // ran 63 and 105. Pin the value so a change to it is a deliberate edit.
+  it("pins the derived threshold", () => {
+    expect(FALSE_LIVENESS_STREAK_THRESHOLD).toBe(5);
+  });
+});
+
+describe("false-liveness escalation", () => {
+  it("returns no escalation below the threshold", () => {
+    expect(
+      resolveFalseLivenessEscalation(
+        repeat(FALSE_LIVENESS_STREAK_THRESHOLD - 1, dead),
+        null,
+      ),
+    ).toBeNull();
+  });
+
+  // FIXTURE 5, second half: trips ONCE, not once per subsequent run.
+  it("reports the escalation only on the transition into the fault", () => {
+    const tripped = repeat(FALSE_LIVENESS_STREAK_THRESHOLD, dead);
+
+    const first = resolveFalseLivenessEscalation(tripped, null);
+    expect(first).toEqual({
+      status: "error",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+      reportEscalation: true,
+    });
+
+    // The next run over the same streak keeps the agent marked but does not
+    // re-report, so the operator sees one escalation per episode.
+    const second = resolveFalseLivenessEscalation(
+      repeat(FALSE_LIVENESS_STREAK_THRESHOLD + 1, dead),
+      FALSE_LIVENESS_ERROR_REASON,
+    );
+    expect(second?.status).toBe("error");
+    expect(second?.reportEscalation).toBe(false);
+  });
+
+  // A generic adapter error must not be mistaken for this fault, so an agent
+  // already in error for another reason still reports this escalation.
+  it("reports when the agent is in error for a different reason", () => {
+    expect(
+      resolveFalseLivenessEscalation(
+        repeat(FALSE_LIVENESS_STREAK_THRESHOLD, dead),
+        "Run ended with failed (provider_quota)",
+      )?.reportEscalation,
+    ).toBe(true);
+  });
+
+  it("names the fault as a credential/config problem, not a generic error", () => {
+    expect(FALSE_LIVENESS_ERROR_REASON).toMatch(/credential/i);
+    expect(FALSE_LIVENESS_ERROR_REASON).toMatch(/config/i);
+    // agents.error_reason is truncated at 500 chars by the caller.
+    expect(FALSE_LIVENESS_ERROR_REASON.length).toBeLessThanOrEqual(500);
+  });
+});

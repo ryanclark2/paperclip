@@ -234,6 +234,8 @@ import {
 } from "./heartbeat-stop-metadata.js";
 import {
   classifyRunLiveness,
+  FALSE_LIVENESS_STREAK_THRESHOLD,
+  resolveFalseLivenessEscalation,
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
 import {
@@ -15652,7 +15654,7 @@ export function heartbeatService(
       options?.wasFirstHeartbeat ?? !existing.lastHeartbeatAt;
 
     const runningCount = await countRunningRunsForAgent(agentId);
-    const nextStatus =
+    const baseStatus =
       runningCount > 0
         ? "running"
         : outcome === "succeeded" ||
@@ -15661,6 +15663,57 @@ export function heartbeatService(
             (outcome === "failed" && options?.keepIdleOnFailure)
           ? "idle"
           : "error";
+
+    // False-liveness detector (ALM-6138). A run that exits cleanly while the
+    // provider reported no tokens and no cost did not reach the model. One such
+    // run is noise; a streak of them means this agent's adapter credentials or
+    // config are broken, and nothing else notices because every run "succeeds".
+    //
+    // This has to happen here rather than in classifyAndPersistRunLiveness:
+    // that hook runs BEFORE finalizeAgentStatus at every finalization site, so
+    // a status written there is overwritten by the `idle` below. This is the
+    // write, so it cannot be clobbered.
+    //
+    // Scoped to the `idle` branch: `running` means another run is in flight and
+    // must not be stomped, and `error` is already unavailable. The streak is
+    // durable, so a run skipped for either reason is caught at the next
+    // finalization.
+    let nextStatus = baseStatus;
+    let resolvedFailureReason = failureReason;
+    let falseLivenessTripped = false;
+    if (baseStatus === "idle" && outcome === "succeeded") {
+      const recentSucceeded = await db
+        .select({
+          status: heartbeatRuns.status,
+          usageJson: heartbeatRuns.usageJson,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, existing.companyId),
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.status, "succeeded"),
+          ),
+        )
+        // Selecting only `succeeded` rows is how "ignore failed/cancelled/
+        // timed_out runs" is implemented: they are neither counted nor allowed
+        // to reset the streak. Ordered by startedAt to ride
+        // heartbeat_runs_company_agent_started_idx. The run being finalized is
+        // already persisted terminal at every call site that passes
+        // "succeeded", so it is included here.
+        .orderBy(desc(heartbeatRuns.startedAt))
+        .limit(FALSE_LIVENESS_STREAK_THRESHOLD);
+
+      const escalation = resolveFalseLivenessEscalation(
+        recentSucceeded,
+        existing.errorReason,
+      );
+      if (escalation) {
+        nextStatus = escalation.status;
+        resolvedFailureReason = escalation.errorReason;
+        falseLivenessTripped = escalation.reportEscalation;
+      }
+    }
 
     const updated = await db
       .update(agents)
@@ -15671,7 +15724,7 @@ export function heartbeatService(
         // events; clear it whenever the agent leaves error.
         errorReason:
           nextStatus === "error"
-            ? truncateAgentErrorReason(failureReason)
+            ? truncateAgentErrorReason(resolvedFailureReason)
             : null,
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
@@ -15679,6 +15732,17 @@ export function heartbeatService(
       .where(eq(agents.id, agentId))
       .returning()
       .then((rows) => rows[0] ?? null);
+
+    if (falseLivenessTripped && updated) {
+      logger.warn(
+        {
+          agentId,
+          agentName: updated.name,
+          streakThreshold: FALSE_LIVENESS_STREAK_THRESHOLD,
+        },
+        "agent marked unavailable: adapter reported no provider usage on the last consecutive succeeded runs",
+      );
+    }
 
     if (isFirstHeartbeat && updated) {
       const tc = getTelemetryClient();
