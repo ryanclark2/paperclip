@@ -101,6 +101,7 @@ import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
 import {
   buildQueuedRunDispatchKey,
   compareQueuedRunDispatchKeys,
+  OPEN_WORK_EXCLUDED_ISSUE_STATUSES,
 } from "./queued-run-dispatch-order.js";
 import { logger } from "../middleware/logger.js";
 import {
@@ -5183,6 +5184,39 @@ async function listUnresolvedBlockerSummaries(
       ),
     )
     .orderBy(asc(issues.title));
+}
+
+/**
+ * Of `issueIds`, the subset that blocks at least one issue that is still open
+ * work. Feeds the queued-run dispatch head start; see
+ * ./queued-run-dispatch-order.js.
+ *
+ * Direction: "X blocks Y" is stored as issueId = X (the blocker) and
+ * relatedIssueId = Y (the dependent), so the join walks relatedIssueId to reach
+ * the dependent and selects issueId back out. Same shape as
+ * listWakeableBlockedDependents in ./issues.js, which decides whether resolving
+ * a blocker actually wakes anyone.
+ */
+async function listIssueIdsBlockingOpenWork(
+  db: Db,
+  companyId: string,
+  issueIds: string[],
+): Promise<Set<string>> {
+  if (issueIds.length === 0) return new Set<string>();
+  const rows = await db
+    .select({ blockerIssueId: issueRelations.issueId })
+    .from(issueRelations)
+    .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
+    .where(
+      and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.type, "blocks"),
+        inArray(issueRelations.issueId, issueIds),
+        eq(issues.companyId, companyId),
+        notInArray(issues.status, [...OPEN_WORK_EXCLUDED_ISSUE_STATUSES]),
+      ),
+    );
+  return new Set(rows.map((row) => row.blockerIssueId));
 }
 
 export function formatRuntimeWorkspaceWarningLog(warning: string) {
@@ -17250,6 +17284,11 @@ export function heartbeatService(
             : sql`false`,
         );
       const issueById = new Map(issueRows.map((row) => [row.id, row]));
+      const issueIdsBlockingOpenWork = await listIssueIdsBlockingOpenWork(
+        db,
+        agent.companyId,
+        queuedIssueIds,
+      );
       const companyAgents = await listCompanyAgentOrgRows(agent.companyId);
       const prioritizedRuns = queuedRuns
         .map((run) => {
@@ -17268,6 +17307,7 @@ export function heartbeatService(
               isDependencyReady: issueId
                 ? (dependencyReadiness.get(issueId)?.isDependencyReady ?? true)
                 : true,
+              issueIdsBlockingOpenWork,
             }),
           };
         })
