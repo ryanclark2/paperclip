@@ -392,6 +392,19 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
 export const FALSE_LIVENESS_STREAK_THRESHOLD = 5;
 
 /**
+ * How many of an agent's most recent succeeded runs to read when measuring the
+ * streak.
+ *
+ * Larger than the threshold because runs that recorded no usage are skipped
+ * rather than counted, so reading exactly `FALSE_LIVENESS_STREAK_THRESHOLD`
+ * rows would let a few skipped runs starve the streak and the detector could
+ * never trip. The bound fails safe in the other direction too: if the window is
+ * all skipped runs the streak is 0 and nothing happens, so a usage-recording
+ * outage defers the detector rather than firing it.
+ */
+export const FALSE_LIVENESS_SCAN_LIMIT = 5 * FALSE_LIVENESS_STREAK_THRESHOLD;
+
+/**
  * Stored verbatim in `agents.error_reason` when the detector trips, and read
  * back to tell this fault apart from a generic adapter failure. Escalation is
  * keyed on an exact match, so changing this string re-fires the escalation
@@ -452,9 +465,9 @@ function readUsageMeasure(value: unknown): number {
  * absent usage as a match would put FoundingEng one run away from being marked
  * unavailable.
  */
-export function reportsZeroProviderUsage(
+export function hasProviderUsageRecord(
   usageJson: Record<string, unknown> | null | undefined,
-): boolean {
+): usageJson is Record<string, unknown> {
   if (!usageJson || typeof usageJson !== "object" || Array.isArray(usageJson)) {
     return false;
   }
@@ -464,9 +477,16 @@ export function reportsZeroProviderUsage(
   // usage metadata without usage numbers. Live runs carry either all four
   // measures (16,104 runs) or the three raw counters without `costUsd` (962),
   // so requiring one still lets a partially-reporting adapter trip.
-  const reported = PROVIDER_USAGE_MEASURE_KEYS.filter((key) => key in usageJson);
-  if (reported.length === 0) return false;
-  return reported.every((key) => readUsageMeasure(usageJson[key]) === 0);
+  return PROVIDER_USAGE_MEASURE_KEYS.some((key) => key in usageJson);
+}
+
+export function reportsZeroProviderUsage(
+  usageJson: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!hasProviderUsageRecord(usageJson)) return false;
+  return PROVIDER_USAGE_MEASURE_KEYS.filter((key) => key in usageJson).every(
+    (key) => readUsageMeasure(usageJson[key]) === 0,
+  );
 }
 
 /** True for a `succeeded` run whose provider reported no usage and no cost. */
@@ -494,6 +514,12 @@ export function falseLivenessStreak(
   let streak = 0;
   for (const run of runsNewestFirst) {
     if (run.status !== "succeeded") continue;
+    // A succeeded run that recorded no usage at all is evidence of neither
+    // life nor death, so it is skipped exactly like a failed run. Counting it
+    // would let a fleet-wide usage-recording regression mark every agent
+    // unavailable at once; resetting on it would let an instrumentation gap
+    // mask a genuinely dead agent.
+    if (!hasProviderUsageRecord(run.usageJson)) continue;
     if (!reportsZeroProviderUsage(run.usageJson)) break;
     streak += 1;
   }

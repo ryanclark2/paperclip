@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   FALSE_LIVENESS_ERROR_REASON,
+  FALSE_LIVENESS_SCAN_LIMIT,
   FALSE_LIVENESS_STREAK_THRESHOLD,
   falseLivenessStreak,
+  hasProviderUsageRecord,
   isFalseLivenessRun,
   reportsZeroProviderUsage,
   resolveFalseLivenessEscalation,
@@ -123,8 +125,11 @@ describe("false-liveness predicate", () => {
     ["null", null],
     ["undefined", undefined],
     ["empty object", {}],
-  ])("does NOT match when usageJson is %s", (_label, usageJson) => {
+    ["an object with no measures", { model: "x", biller: "y" }],
+  ])("carries no usage record when usageJson is %s", (_label, usageJson) => {
+    expect(hasProviderUsageRecord(usageJson as never)).toBe(false);
     expect(reportsZeroProviderUsage(usageJson as never)).toBe(false);
+    // Never enough on its own to mark an agent unavailable.
     expect(
       tripsFalseLivenessDetector(
         repeat(50, () => ({
@@ -135,8 +140,23 @@ describe("false-liveness predicate", () => {
     ).toBe(false);
   });
 
-  it("does not match a usage object carrying no measures at all", () => {
-    expect(reportsZeroProviderUsage({ model: "x", biller: "y" })).toBe(false);
+  it("carries a usage record when only some measures are present", () => {
+    // 962 live runs report the three raw counters without costUsd; a
+    // partially-reporting adapter must still be able to trip.
+    expect(
+      hasProviderUsageRecord({
+        rawInputTokens: 0,
+        rawOutputTokens: 0,
+        rawCachedInputTokens: 0,
+      }),
+    ).toBe(true);
+    expect(
+      reportsZeroProviderUsage({
+        rawInputTokens: 0,
+        rawOutputTokens: 0,
+        rawCachedInputTokens: 0,
+      }),
+    ).toBe(true);
   });
 
   it("reads numeric strings, and treats malformed values as absent", () => {
@@ -172,6 +192,58 @@ describe("false-liveness streak accounting", () => {
         ]),
       ).toBe(FALSE_LIVENESS_STREAK_THRESHOLD);
     }
+  });
+
+  // FIXTURE 7, streak half. A succeeded run with no usage record is IGNORED —
+  // it neither counts nor resets — the same treatment as a failed run. This is
+  // what separates "ignore" from "reset": the streak spans the gap.
+  it("ignores a succeeded run that recorded no usage, without resetting", () => {
+    const noSignal = (): RunUsageSample => ({
+      status: "succeeded",
+      usageJson: null,
+    });
+
+    // 2 dead + a recording gap + 3 dead is still a streak of 5.
+    const spanning = [
+      ...repeat(2, dead),
+      noSignal(),
+      ...repeat(3, dead),
+    ];
+    expect(falseLivenessStreak(spanning)).toBe(FALSE_LIVENESS_STREAK_THRESHOLD);
+    expect(tripsFalseLivenessDetector(spanning)).toBe(true);
+
+    // But the gap adds nothing on its own: 4 dead around it stays at 4.
+    const short = [...repeat(2, dead), ...repeat(9, noSignal), ...repeat(2, dead)];
+    expect(falseLivenessStreak(short)).toBe(4);
+    expect(tripsFalseLivenessDetector(short)).toBe(false);
+
+    // And a healthy run still resets THROUGH a gap.
+    expect(
+      falseLivenessStreak([
+        ...repeat(3, dead),
+        noSignal(),
+        healthy(),
+        ...repeat(9, dead),
+      ]),
+    ).toBe(3);
+  });
+
+  // The scan window must be wide enough that skipped runs cannot starve the
+  // streak: reading only THRESHOLD rows would make the detector unable to trip
+  // whenever a recording gap sits in the window.
+  it("scans a window wider than the threshold", () => {
+    expect(FALSE_LIVENESS_SCAN_LIMIT).toBeGreaterThan(
+      FALSE_LIVENESS_STREAK_THRESHOLD,
+    );
+    const window: RunUsageSample[] = [
+      ...repeat(FALSE_LIVENESS_SCAN_LIMIT - FALSE_LIVENESS_STREAK_THRESHOLD, () => ({
+        status: "succeeded",
+        usageJson: null,
+      })),
+      ...repeat(FALSE_LIVENESS_STREAK_THRESHOLD, dead),
+    ];
+    expect(window.length).toBe(FALSE_LIVENESS_SCAN_LIMIT);
+    expect(tripsFalseLivenessDetector(window)).toBe(true);
   });
 
   // FIXTURE 4 — the off-by-one below the threshold.

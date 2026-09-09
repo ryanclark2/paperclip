@@ -234,6 +234,7 @@ import {
 } from "./heartbeat-stop-metadata.js";
 import {
   classifyRunLiveness,
+  FALSE_LIVENESS_SCAN_LIMIT,
   FALSE_LIVENESS_STREAK_THRESHOLD,
   resolveFalseLivenessEscalation,
   type RunLivenessClassificationInput,
@@ -15663,7 +15664,7 @@ export function heartbeatService(
         ),
       )
       .orderBy(desc(heartbeatRuns.startedAt))
-      .limit(FALSE_LIVENESS_STREAK_THRESHOLD);
+      .limit(FALSE_LIVENESS_SCAN_LIMIT);
   }
 
   async function finalizeAgentStatus(
