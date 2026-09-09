@@ -447,7 +447,7 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
   });
 
   it("uses normal promotion gates and records gate-suppressed retries", async () => {
-    const { companyId, issueId, retryRunId } = await seedIssueWithRetry({ agentStatus: "paused" });
+    const { companyId, issueId, retryRunId, sourceRunId } = await seedIssueWithRetry({ agentStatus: "paused" });
 
     const res = await request(createApp(boardActor(companyId)))
       .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
@@ -496,6 +496,31 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
         runId: retryRunId,
       },
     ]);
+
+    // The route still records the attempt (above), but the *run* is untouched:
+    // no "requested to run now" lifecycle event and no retry-now stamps on the
+    // context snapshot. This is what pins the pre-flight specifically. Delete
+    // the pre-flight and the acceleration write runs before the gate refuses,
+    // leaving both traces behind even though the restore path puts
+    // `scheduledRetryAt` back.
+    const events = await db
+      .select({ message: heartbeatRunEvents.message })
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, retryRunId));
+    expect(events).toEqual([]);
+
+    const [snapshotRow] = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    expect(snapshotRow.contextSnapshot).toEqual({
+      issueId,
+      wakeReason: "bounded_transient_heartbeat_retry",
+      retryOfRunId: sourceRunId,
+      scheduledRetryAt: "2026-05-06T19:00:00.000Z",
+      scheduledRetryAttempt: 2,
+      retryReason: "transient_failure",
+    });
   });
 
   it("does not promote a scheduled retry after on-demand wakes are disabled", async () => {
