@@ -15637,6 +15637,35 @@ export function heartbeatService(
     return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
   }
 
+  /**
+   * The agent's most recent succeeded runs, newest first, for the
+   * false-liveness streak (ALM-6138).
+   *
+   * Selecting only `succeeded` rows is how "ignore failed/cancelled/timed_out
+   * runs" is implemented: they are neither counted toward the streak nor
+   * allowed to reset it. Ordered by startedAt to ride
+   * heartbeat_runs_company_agent_started_idx. The run being finalized is
+   * already persisted terminal at every call site that reports "succeeded", so
+   * it is included here.
+   */
+  async function readRecentSucceededRunUsage(companyId: string, agentId: string) {
+    return db
+      .select({
+        status: heartbeatRuns.status,
+        usageJson: heartbeatRuns.usageJson,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "succeeded"),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.startedAt))
+      .limit(FALSE_LIVENESS_STREAK_THRESHOLD);
+  }
+
   async function finalizeAgentStatus(
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
@@ -15678,42 +15707,16 @@ export function heartbeatService(
     // must not be stomped, and `error` is already unavailable. The streak is
     // durable, so a run skipped for either reason is caught at the next
     // finalization.
-    let nextStatus = baseStatus;
-    let resolvedFailureReason = failureReason;
-    let falseLivenessTripped = false;
-    if (baseStatus === "idle" && outcome === "succeeded") {
-      const recentSucceeded = await db
-        .select({
-          status: heartbeatRuns.status,
-          usageJson: heartbeatRuns.usageJson,
-        })
-        .from(heartbeatRuns)
-        .where(
-          and(
-            eq(heartbeatRuns.companyId, existing.companyId),
-            eq(heartbeatRuns.agentId, agentId),
-            eq(heartbeatRuns.status, "succeeded"),
-          ),
-        )
-        // Selecting only `succeeded` rows is how "ignore failed/cancelled/
-        // timed_out runs" is implemented: they are neither counted nor allowed
-        // to reset the streak. Ordered by startedAt to ride
-        // heartbeat_runs_company_agent_started_idx. The run being finalized is
-        // already persisted terminal at every call site that passes
-        // "succeeded", so it is included here.
-        .orderBy(desc(heartbeatRuns.startedAt))
-        .limit(FALSE_LIVENESS_STREAK_THRESHOLD);
-
-      const escalation = resolveFalseLivenessEscalation(
-        recentSucceeded,
-        existing.errorReason,
-      );
-      if (escalation) {
-        nextStatus = escalation.status;
-        resolvedFailureReason = escalation.errorReason;
-        falseLivenessTripped = escalation.reportEscalation;
-      }
-    }
+    const falseLivenessEscalation =
+      baseStatus === "idle" && outcome === "succeeded"
+        ? resolveFalseLivenessEscalation(
+            await readRecentSucceededRunUsage(existing.companyId, agentId),
+            existing.errorReason,
+          )
+        : null;
+    const nextStatus = falseLivenessEscalation?.status ?? baseStatus;
+    const resolvedFailureReason =
+      falseLivenessEscalation?.errorReason ?? failureReason;
 
     const updated = await db
       .update(agents)
@@ -15733,7 +15736,7 @@ export function heartbeatService(
       .returning()
       .then((rows) => rows[0] ?? null);
 
-    if (falseLivenessTripped && updated) {
+    if (falseLivenessEscalation?.reportEscalation && updated) {
       logger.warn(
         {
           agentId,
