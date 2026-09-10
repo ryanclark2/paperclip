@@ -378,6 +378,19 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "issue_dependencies_blocked",
 ]);
 
+// Auth errors that signal a fleet-wide outage rather than a per-issue failure.
+// Issues with these codes must not be parked or reassigned — the adapter will
+// recover once credentials are restored, and the issue should resume in place.
+export const FLEET_GATED_CONTINUATION_ERROR_CODES = new Set<string>([
+  "claude_auth_required",
+  "acpx_auth_required",
+]);
+
+// How far back to look when deciding whether the fleet adapter is in an auth outage.
+const FLEET_GATED_OUTAGE_LOOKBACK_MS = 2 * 60 * 60 * 1000; // 2 hours
+// Deduplicate per-issue outage notices to at most one per this window.
+const FLEET_GATED_NOTICE_DEDUPE_WINDOW_MS = 4 * 60 * 60 * 1000; // 4 hours
+
 // A continuation cancelled with this code is a *deliberate wait* (the latest run
 // reported it was parked for review/approval), not a lost execution path. When the
 // issue has a real waiting target we convert it into a normal dependency wait rather
@@ -566,7 +579,12 @@ export function withAdapterFailureRecoveryClassification(
 }
 
 type ContinuationRetryClassification = {
-  kind: "transient_infra" | "non_retryable" | "deliberate_wait_without_target" | "default";
+  kind:
+    | "transient_infra"
+    | "non_retryable"
+    | "deliberate_wait_without_target"
+    | "fleet_gated"
+    | "default";
   maxAttempts: number;
   baseBackoffMs: number;
   errorCode: string | null;
@@ -585,6 +603,11 @@ export function classifyContinuationFailure(latestRun: LatestIssueRun): Continua
   if (errorCode && NON_RETRYABLE_CONTINUATION_ERROR_CODES.has(errorCode)) {
     return { kind: "non_retryable", maxAttempts: 0, baseBackoffMs: 0, errorCode };
   }
+  if (errorCode && FLEET_GATED_CONTINUATION_ERROR_CODES.has(errorCode)) {
+    // maxAttempts/baseBackoffMs are unused for fleet_gated — retry cadence is
+    // governed by the fleet-level auth check, not a per-issue attempt counter.
+    return { kind: "fleet_gated", maxAttempts: 0, baseBackoffMs: 0, errorCode };
+  }
   if (errorCode && TRANSIENT_INFRA_CONTINUATION_ERROR_CODES.has(errorCode)) {
     return {
       kind: "transient_infra",
@@ -599,6 +622,20 @@ export function classifyContinuationFailure(latestRun: LatestIssueRun): Continua
     baseBackoffMs: 0,
     errorCode,
   };
+}
+
+// Decides the fleet-outage question from a window of recent sibling runs: true only
+// when ALL runs in the window failed AND at least one carried the auth error code.
+// A single success is enough to declare the fleet healthy, which routes the issue to
+// bounded per-agent escalation instead of the outage hold. Kept pure and separate
+// from the DB query so that decision is directly testable (ADR-004 control 1).
+export function decideFleetAuthOutage(
+  recentRuns: ReadonlyArray<{ status: string; errorCode: string | null }>,
+  errorCode: string,
+): boolean {
+  if (recentRuns.length === 0) return false;
+  if (recentRuns.some((r) => r.status === "succeeded")) return false;
+  return recentRuns.some((r) => r.errorCode === errorCode);
 }
 
 function successfulRunHandoffRecoveryEvidence(latestRun: LatestIssueRun): SuccessfulRunHandoffRecoveryEvidence | null {
@@ -848,6 +885,81 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (latestFinishedAt === null) latestFinishedAt = row.finishedAt ?? null;
     }
     return { consecutive, latestFinishedAt };
+  }
+
+  // True when every recent finished run from agents of this adapter type failed and
+  // at least one carried the given auth-error code — i.e. the fleet, not this issue,
+  // is what is broken. One success inside the lookback window declares auth healthy.
+  async function isFleetAdapterInAuthOutage(
+    companyId: string,
+    agentId: string,
+    errorCode: string,
+  ): Promise<boolean> {
+    const agent = await getAgent(agentId);
+    if (!agent) return false;
+
+    const windowStart = new Date(Date.now() - FLEET_GATED_OUTAGE_LOOKBACK_MS);
+    const recentRuns = await db
+      .select({
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(agents.adapterType, agent.adapterType),
+          gte(heartbeatRuns.createdAt, windowStart),
+          inArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(100);
+
+    return decideFleetAuthOutage(recentRuns, errorCode);
+  }
+
+  // Posts at most one outage notice per FLEET_GATED_NOTICE_DEDUPE_WINDOW_MS on the
+  // issue. Leaves the issue in its current status — it does NOT park or reassign.
+  async function maybePostFleetAuthOutageNotice(issueId: string, errorCode: string) {
+    const marker = `fleet_auth_outage:${errorCode}`;
+    const windowStart = new Date(Date.now() - FLEET_GATED_NOTICE_DEDUPE_WINDOW_MS);
+    const hasRecentNotice = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.authorType, "system"),
+          gte(issueComments.createdAt, windowStart),
+        ),
+      )
+      .then((rows) => rows.some((r) => (r.body ?? "").includes(marker)));
+    if (hasRecentNotice) return;
+
+    await issuesSvc.addComment(
+      issueId,
+      `Paperclip detected a fleet authentication outage (\`${errorCode}\`). ` +
+        "Execution is on hold until adapter credentials are restored — this issue will " +
+        "resume automatically once auth succeeds. No intervention needed unless the " +
+        `outage persists.\n\n<!-- ${marker} -->`,
+      {},
+      {
+        authorType: "system",
+        presentation: compactRecoveryPresentation("Recovery: fleet authentication outage — execution on hold"),
+        metadata: {
+          version: 1,
+          sections: [{
+            title: "Recovery",
+            rows: [
+              { type: "key_value", label: "Cause", value: "fleet_auth_outage" },
+              { type: "key_value", label: "Error code", value: errorCode },
+            ],
+          }],
+        },
+      },
+    );
   }
 
   async function hasActiveExecutionPath(companyId: string, issueId: string, agentId?: string | null) {
@@ -4003,6 +4115,40 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         if (didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
+          const todoErrorCode = readNonEmptyString(latestRun?.errorCode);
+          if (todoErrorCode && FLEET_GATED_CONTINUATION_ERROR_CODES.has(todoErrorCode)) {
+            if (await isFleetAdapterInAuthOutage(issue.companyId, agentId, todoErrorCode)) {
+              // Fleet-wide auth outage: never park and never reassign. The issue keeps
+              // its assignee and resumes on a later sweep once credentials return.
+              await maybePostFleetAuthOutageNotice(issue.id, todoErrorCode);
+              result.skipped += 1;
+              continue;
+            }
+            // Fleet healthy (a sibling succeeded) but this agent's auth still fails —
+            // a per-agent credential problem. Escalate: bounded and visible. Falling
+            // through to the dispatch requeue below would retry every sweep forever.
+            const updatedFleetGatedTodo = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: "todo",
+              latestRun,
+              notice: {
+                body:
+                  "The fleet adapter appears healthy (a sibling agent succeeded recently) but this " +
+                  `agent's auth is still failing (\`${todoErrorCode}\`). ` +
+                  "This is likely a per-agent credential issue. Moving it to `blocked` for intervention.",
+                title: "Per-agent auth failure",
+                tone: "danger",
+              },
+            });
+            if (updatedFleetGatedTodo) {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
+
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "todo",
@@ -4192,6 +4338,42 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             },
           });
           if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+
+        if (classification.kind === "fleet_gated" && classification.errorCode) {
+          const fleetErrorCode = classification.errorCode;
+          if (await isFleetAdapterInAuthOutage(issue.companyId, agentId, fleetErrorCode)) {
+            // Fleet-wide auth outage: never park and never reassign. The issue keeps
+            // its assignee and resumes on a later sweep once credentials return.
+            await maybePostFleetAuthOutageNotice(issue.id, fleetErrorCode);
+            result.skipped += 1;
+            continue;
+          }
+          // Fleet healthy (a sibling succeeded) but this agent's auth still fails —
+          // a per-agent credential problem. Escalate: bounded and visible, the same
+          // shape as the default bucket. Falling through to enqueueStrandedIssueRecovery
+          // here would re-enqueue on every sweep with no attempt cap, no backoff and
+          // no board-visible signal.
+          const updatedFleetGated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun,
+            notice: {
+              body:
+                "The fleet adapter appears healthy (a sibling agent succeeded recently) but this " +
+                `agent's auth is still failing (\`${fleetErrorCode}\`). ` +
+                "This is likely a per-agent credential issue. Moving it to `blocked` for intervention.",
+              title: "Per-agent auth failure",
+              tone: "danger",
+            },
+          });
+          if (updatedFleetGated) {
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
