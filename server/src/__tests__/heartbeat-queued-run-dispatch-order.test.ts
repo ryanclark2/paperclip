@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { ISSUE_STATUSES } from "@paperclipai/shared";
 import {
   buildQueuedRunDispatchKey,
   compareQueuedRunDispatchKeys,
@@ -40,6 +41,19 @@ function runKey(input: {
 /** Sorts and returns run ids, so every assertion can be a whole-array toEqual. */
 function dispatchOrder(keys: readonly QueuedRunDispatchKey[]): string[] {
   return sortQueuedRunDispatchKeys(keys).map((key) => key.runId);
+}
+
+/** Readiness rank for one issue status, holding every other input fixed. */
+function readinessRankFor(issueStatus: string | null | undefined): number {
+  return buildQueuedRunDispatchKey({
+    runId: "probe",
+    createdAtMs: NOW,
+    issueId: "issue-probe",
+    issueStatus,
+    issuePriority: "high",
+    isDependencyReady: true,
+    issueIdsBlockingOpenWork: new Set<string>(),
+  }).readinessRank;
 }
 
 describe("queued-run dispatch ordering", () => {
@@ -228,6 +242,56 @@ describe("queued-run dispatch ordering", () => {
     expect(dispatchOrder([sameMsB, sameMsA])).toEqual(["aaa", "bbb"]);
     expect(dispatchOrder([sameMsA, sameMsB])).toEqual(["aaa", "bbb"]);
     expect(compareQueuedRunDispatchKeys(sameMsA, sameMsA)).toBe(0);
+  });
+
+  it("keeps in_review and blocked in the ready band, behind in_progress", () => {
+    // The two band boundaries. Only `in_progress` earns the top band; every
+    // other status a queued run's issue can hold is merely `ready`. Adding a
+    // disjunct to that check (`|| issueStatus === "in_review"`) promotes work
+    // that has left the author's hands ahead of work actually in flight.
+    expect(readinessRankFor("in_review")).toBe(QUEUED_RUN_READINESS_RANK.ready);
+    expect(readinessRankFor("blocked")).toBe(QUEUED_RUN_READINESS_RANK.ready);
+
+    // Same rank means the head start still decides between them, and both stay
+    // behind an in_progress run of identical age and priority.
+    const inProgress = runKey({ runId: "in-progress", ageMs: 0 });
+    const inReview = runKey({ runId: "in-review", ageMs: 0, status: "in_review" });
+    const blocked = runKey({ runId: "blocked", ageMs: 0, status: "blocked" });
+    expect(dispatchOrder([blocked, inReview, inProgress])).toEqual([
+      "in-progress",
+      "blocked",
+      "in-review",
+    ]);
+  });
+
+  it("pins the whole status-to-readiness map by equality", () => {
+    // Equality over the entire declared status enum, not a probe per status a
+    // mutant happens to name: a widened condition moves exactly one row here
+    // and cannot hide behind a rank-number assertion (ADR-004 Amendment 6).
+    expect(
+      ISSUE_STATUSES.map((status) => [status, readinessRankFor(status)]),
+    ).toEqual([
+      ["backlog", QUEUED_RUN_READINESS_RANK.ready],
+      ["todo", QUEUED_RUN_READINESS_RANK.ready],
+      ["in_progress", QUEUED_RUN_READINESS_RANK.inProgressAndReady],
+      ["in_review", QUEUED_RUN_READINESS_RANK.ready],
+      ["done", QUEUED_RUN_READINESS_RANK.ready],
+      ["blocked", QUEUED_RUN_READINESS_RANK.ready],
+      ["cancelled", QUEUED_RUN_READINESS_RANK.ready],
+    ]);
+    // A status outside the enum, and a missing one, must land in the same band
+    // rather than in the top one.
+    expect([null, undefined, "not-a-status"].map(readinessRankFor)).toEqual([
+      QUEUED_RUN_READINESS_RANK.ready,
+      QUEUED_RUN_READINESS_RANK.ready,
+      QUEUED_RUN_READINESS_RANK.ready,
+    ]);
+    // Dependency readiness is checked before status, so an in_progress issue
+    // that is not dependency-ready lands in the bottom band, not the top one.
+    expect(
+      runKey({ runId: "not-ready", ageMs: 0, dependencyReady: false })
+        .readinessRank,
+    ).toBe(QUEUED_RUN_READINESS_RANK.dependencyNotReady);
   });
 
   it("pins the head start and the open-work exclusion list exactly", () => {
