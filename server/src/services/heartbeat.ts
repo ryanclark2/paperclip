@@ -603,6 +603,21 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
   30 * 60 * 1000,
   2 * 60 * 60 * 1000,
 ] as const;
+// Horizon below which a provider-printed retry-not-before hint is honoured
+// exactly. Session-class walls are near-total and their printed reset is
+// accurate (measured 2026-09-04: 109 failed dispatches vs 5 successes over
+// 8.5h, first success 5s after the printed reset), so parking short of the
+// reset only burns dispatches. Weekly-class resets sit days out and their
+// walls are intermittent, so a hint beyond this horizon must never set the
+// in-budget delay — it gets the probe cadence below instead.
+export const BOUNDED_TRANSIENT_HEARTBEAT_HINT_HONOR_HORIZON_MS =
+  6 * 60 * 60 * 1000;
+// Probe cadence for a hint beyond the honor horizon. Matches the last entry
+// of the backoff table: the scheduler already tolerates that gap between
+// attempts on its own, so a longer vendor wall gets re-probed once per cap
+// window while the transient retry budget lasts.
+export const BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS =
+  2 * 60 * 60 * 1000;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
@@ -879,6 +894,17 @@ function readTransientRetryNotBeforeFromRun(
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+// True only when the writer of the retry-not-before stamp attested that it
+// was parsed out of a real vendor error (adapter parse, or the recovery
+// classifier's clock-reset parse). Synthetic stamps — e.g. the recovery
+// classifier's fixed default backoff when nothing parseable exists — carry
+// `false`, and stamps persisted before the flag existed read as unproven.
+function readTransientRetryResetTimeParsedFromRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">,
+) {
+  return parseObject(run.resultJson).transientRetryResetTimeParsed === true;
+}
+
 function readTransientRecoveryContractFromRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
@@ -888,6 +914,7 @@ function readTransientRecoveryContractFromRun(
     ? {
         errorFamily,
         retryNotBefore: readTransientRetryNotBeforeFromRun(run),
+        resetTimeParsed: readTransientRetryResetTimeParsedFromRun(run),
       }
     : null;
 }
@@ -984,6 +1011,10 @@ function mergeAdapterRecoveryMetadata(input: {
       ? {
           retryNotBefore,
           transientRetryNotBefore: retryNotBefore,
+          // An adapter-reported retry-not-before is a parse of the vendor's
+          // own error by construction — this function only fires on values
+          // the adapter extracted and reported.
+          transientRetryResetTimeParsed: true,
           ...(errorFamily === "provider_quota"
             ? { providerQuotaRetryNotBefore: retryNotBefore }
             : {}),
@@ -13346,10 +13377,7 @@ export function heartbeatService(
     return cancelled;
   }
 
-  async function promoteScheduledRetryRun(
-    dueRun: typeof heartbeatRuns.$inferSelect,
-    now: Date,
-  ): Promise<
+  type ScheduledRetryPromotion =
     | { outcome: "promoted"; run: typeof heartbeatRuns.$inferSelect }
     | {
         outcome: "gate_suppressed";
@@ -13357,57 +13385,111 @@ export function heartbeatService(
         reason: string;
         errorCode: BlockedScheduledRetryGate["errorCode"];
       }
-    | { outcome: "not_promoted"; run: typeof heartbeatRuns.$inferSelect | null }
-  > {
-    const agent = await getAgent(dueRun.agentId);
+    | { outcome: "not_promoted"; run: typeof heartbeatRuns.$inferSelect | null };
+
+  /**
+   * The gate blocking promotion of `run`, or null when promotion may proceed.
+   *
+   * Shared by `promoteScheduledRetryRun` and the retry-now pre-flight so the
+   * two cannot drift. A retry-now caller must be refused by exactly the gate
+   * that would have stopped the promotion — including the legacy `issue_not_found`
+   * carve-out below, which is a *pass*, not a block.
+   */
+  async function blockingScheduledRetryGate(
+    run: typeof heartbeatRuns.$inferSelect,
+  ): Promise<Extract<ScheduledRetryGate, { allowed: false }> | null> {
+    const agent = await getAgent(run.agentId);
     if (!agent) {
-      const gate = {
-        allowed: false as const,
+      return {
+        allowed: false,
         reason: "Scheduled retry suppressed because the agent no longer exists",
-        errorCode: "agent_not_invokable" as const,
-        issueId: readNonEmptyString(
-          parseObject(dueRun.contextSnapshot).issueId,
-        ),
-        details: { agentId: dueRun.agentId },
+        errorCode: "agent_not_invokable",
+        issueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
+        details: { agentId: run.agentId },
       };
-      const cancelled = await cancelScheduledRetryForGate(dueRun, gate, now);
-      return cancelled
-        ? {
-            outcome: "gate_suppressed",
-            run: cancelled,
-            reason: gate.reason,
-            errorCode: gate.errorCode,
-          }
-        : { outcome: "not_promoted", run: null };
     }
 
-    const contextSnapshot = parseObject(dueRun.contextSnapshot);
     const gate = await evaluateScheduledRetryGate({
-      run: dueRun,
+      run,
       agent,
-      contextSnapshot,
-      retryReason: dueRun.scheduledRetryReason,
+      contextSnapshot: parseObject(run.contextSnapshot),
+      retryReason: run.scheduledRetryReason,
       enforceIssueExecutionLock:
-        dueRun.scheduledRetryReason === MAX_TURN_CONTINUATION_RETRY_REASON,
+        run.scheduledRetryReason === MAX_TURN_CONTINUATION_RETRY_REASON,
     });
-    if (!gate.allowed) {
-      if (
-        gate.errorCode === "issue_not_found" &&
-        dueRun.scheduledRetryReason !== MAX_TURN_CONTINUATION_RETRY_REASON
-      ) {
-        // Preserve legacy transient retry behavior for runs that only carry a
-        // loose task context rather than a persisted issue row.
-      } else {
-        const cancelled = await cancelScheduledRetryForGate(dueRun, gate, now);
-        return cancelled
-          ? {
-              outcome: "gate_suppressed",
-              run: cancelled,
-              reason: gate.reason,
-              errorCode: gate.errorCode,
-            }
-          : { outcome: "not_promoted", run: null };
-      }
+    if (gate.allowed) return null;
+
+    if (
+      gate.errorCode === "issue_not_found" &&
+      run.scheduledRetryReason !== MAX_TURN_CONTINUATION_RETRY_REASON
+    ) {
+      // Preserve legacy transient retry behavior for runs that only carry a
+      // loose task context rather than a persisted issue row.
+      return null;
+    }
+
+    return gate;
+  }
+
+  /**
+   * Resolve a suppressing gate into a promotion outcome.
+   *
+   * The single place that decides whether suppression *destroys* the parked
+   * retry. Keep it that way: both of `promoteScheduledRetryRun`'s suppression
+   * sites route through here, so the destructive arm cannot be re-added on one
+   * of them alone.
+   */
+  async function suppressScheduledRetryForGate(
+    run: typeof heartbeatRuns.$inferSelect,
+    gate: Extract<ScheduledRetryGate, { allowed: false }>,
+    now: Date,
+    cancelOnGateSuppression: boolean,
+  ): Promise<ScheduledRetryPromotion> {
+    if (!cancelOnGateSuppression) {
+      return {
+        outcome: "gate_suppressed",
+        run,
+        reason: gate.reason,
+        errorCode: gate.errorCode,
+      };
+    }
+    const cancelled = await cancelScheduledRetryForGate(run, gate, now);
+    return cancelled
+      ? {
+          outcome: "gate_suppressed",
+          run: cancelled,
+          reason: gate.reason,
+          errorCode: gate.errorCode,
+        }
+      : { outcome: "not_promoted", run: null };
+  }
+
+  /**
+   * Promote a due `scheduled_retry` run into the queued pool.
+   *
+   * `cancelOnGateSuppression` decides what a suppressing gate does to the
+   * parked retry. The scheduler passes `true` (the default): the retry's time
+   * came, the agent cannot run, so the retry is spent and gets cancelled.
+   *
+   * The retry-now accelerator passes `false`. Nothing there is "spent" — the
+   * caller only asked for the retry to run *earlier*, and no route re-arms a
+   * `scheduled_retry` run once it is cancelled, so cancelling on that path
+   * destroys state that only the board can hand-repair. See
+   * `retryScheduledRetryNow`.
+   */
+  async function promoteScheduledRetryRun(
+    dueRun: typeof heartbeatRuns.$inferSelect,
+    now: Date,
+    options: { cancelOnGateSuppression?: boolean } = {},
+  ): Promise<ScheduledRetryPromotion> {
+    const gate = await blockingScheduledRetryGate(dueRun);
+    if (gate) {
+      return suppressScheduledRetryForGate(
+        dueRun,
+        gate,
+        now,
+        options.cancelOnGateSuppression ?? true,
+      );
     }
 
     const promoted = await db
@@ -13514,19 +13596,66 @@ export function heartbeatService(
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
+    const transientRetryResetTimeParsed =
+      transientRecovery?.resetTimeParsed ?? false;
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
 
-    if (!baseSchedule) {
+    // A provider-printed reset hint that is still in the future explains the
+    // failure only for part of the channel: an adapter-parsed (or recovery-
+    // classifier-parsed) stamp really is the vendor promising recovery at a
+    // known instant, but the same resultJson keys also carried synthetic
+    // default-backoff stamps that promise nothing (ALM-7596 B1-r2). So the
+    // budget must not abandon a run while a PROVEN promise is live — and
+    // must not probe forever either. The post-budget allowance is exactly
+    // one final park AT the printed reset (the promise as last resort, not a
+    // probe treadmill), taken only when the stamp's writer attested a real
+    // parse. The next failure after that park exhausts terminally, as does
+    // any hint that is unproven, absent, or already in the past.
+    const liveTransientResetHint =
+      transientRetryNotBefore &&
+      transientRetryNotBefore.getTime() > now.getTime()
+        ? transientRetryNotBefore
+        : null;
+    const finalHintParkDelayMs =
+      !baseSchedule &&
+      liveTransientResetHint &&
+      transientRetryResetTimeParsed &&
+      nextAttempt === maxAttempts + 1
+        ? Math.max(
+            1_000,
+            liveTransientResetHint.getTime() - now.getTime(),
+          )
+        : null;
+    const finalHintParkSchedule =
+      finalHintParkDelayMs !== null
+        ? {
+            attempt: nextAttempt,
+            baseDelayMs: finalHintParkDelayMs,
+            delayMs: finalHintParkDelayMs,
+            dueAt: new Date(now.getTime() + finalHintParkDelayMs),
+            maxAttempts,
+          }
+        : null;
+    const effectiveBaseSchedule = baseSchedule ?? finalHintParkSchedule;
+
+    if (!effectiveBaseSchedule) {
       await appendRunEvent(run, {
         eventType: "lifecycle",
         stream: "system",
-        level: "warn",
+        level:
+          retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
+            ? "error"
+            : "warn",
         message: `Bounded retry exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts; no further automatic retry will be queued`,
         payload: {
           retryReason,
           scheduledRetryAttempt: run.scheduledRetryAttempt ?? 0,
           maxAttempts,
+          issueId,
+          transientRetryNotBefore:
+            transientRetryNotBefore?.toISOString() ?? null,
+          transientRetryResetTimeParsed,
         },
       });
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
@@ -13550,6 +13679,24 @@ export function heartbeatService(
         attempt: nextAttempt,
         maxAttempts,
       };
+    }
+
+    if (finalHintParkSchedule) {
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: `Bounded retry budget exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts, but a parsed provider reset hint is still ahead; taking one final park at the printed reset instead of abandoning the run`,
+        payload: {
+          retryReason,
+          scheduledRetryAttempt: nextAttempt,
+          maxAttempts,
+          issueId,
+          transientRetryNotBefore:
+            liveTransientResetHint?.toISOString() ?? null,
+          scheduledRetryAt: finalHintParkSchedule.dueAt.toISOString(),
+        },
+      });
     }
 
     if (retryReason !== MAX_TURN_CONTINUATION_RETRY_REASON) {
@@ -13580,18 +13727,62 @@ export function heartbeatService(
       }
     }
 
+    const providerDeferralCapAt = new Date(
+      now.getTime() + BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS,
+    );
+    const hintHonorHorizonAt = new Date(
+      now.getTime() + BOUNDED_TRANSIENT_HEARTBEAT_HINT_HONOR_HORIZON_MS,
+    );
+    // Explicit boolean rather than reference identity, so the signal survives
+    // a refactor that rebuilds the Date object in either branch.
+    // A hint at or inside the honor horizon is honoured exactly (session-
+    // class walls are near-total; parking short of the printed reset only
+    // burns dispatches) — but the horizon is earned by the writer's parse
+    // attestation. An unproven stamp (attested false, or written before the
+    // attestation flag existed — every pre-existing heartbeat_runs row) only
+    // ever gets the probe-cadence cap: the horizon is a raise over the cap
+    // those rows were written under, and extending it to stamps nobody
+    // parsed would let legacy rows steer a 6h deferral. A hint beyond its
+    // honor limit is capped down to the probe cadence. The final post-budget
+    // park is naturally exempt: its dueAt is the printed reset itself, later
+    // than the capped instant, so the later-wins selection below keeps it.
+    const transientRetryHintHonorLimitAt = transientRetryResetTimeParsed
+      ? hintHonorHorizonAt
+      : providerDeferralCapAt;
+    const transientRetryDeferralWasCapped =
+      transientRetryNotBefore != null &&
+      transientRetryNotBefore.getTime() >
+        transientRetryHintHonorLimitAt.getTime();
+    const cappedTransientRetryNotBefore = transientRetryDeferralWasCapped
+      ? providerDeferralCapAt
+      : transientRetryNotBefore;
     const schedule =
-      transientRetryNotBefore &&
-      transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      cappedTransientRetryNotBefore &&
+      cappedTransientRetryNotBefore.getTime() >
+        effectiveBaseSchedule.dueAt.getTime()
         ? {
-            ...baseSchedule,
-            dueAt: transientRetryNotBefore,
+            ...effectiveBaseSchedule,
+            dueAt: cappedTransientRetryNotBefore,
             delayMs: Math.max(
               0,
-              transientRetryNotBefore.getTime() - now.getTime(),
+              cappedTransientRetryNotBefore.getTime() - now.getTime(),
             ),
           }
-        : baseSchedule;
+        : effectiveBaseSchedule;
+    // Emitted only when the capped instant is the instant the scheduler
+    // actually uses. A truncated hint that then loses the max() against the
+    // jittered backoff did not bind the outcome, and naming it would
+    // advertise an instant the scheduler ignores. When present,
+    // transientRetryDeferralCappedAt always equals scheduledRetryAt.
+    const transientRetryDeferralCapPayload =
+      transientRetryDeferralWasCapped &&
+      schedule.dueAt.getTime() === providerDeferralCapAt.getTime()
+        ? {
+            transientRetryDeferralCappedAt: providerDeferralCapAt.toISOString(),
+            transientRetryDeferralCapMs:
+              BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS,
+          }
+        : null;
 
     const requiresIssueGate =
       retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
@@ -13690,6 +13881,7 @@ export function heartbeatService(
                 transientRetryNotBefore.toISOString(),
             }
           : {}),
+        ...(transientRetryDeferralCapPayload ?? {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
       },
       "normal_model",
@@ -13982,6 +14174,7 @@ export function heartbeatService(
                         transientRetryNotBefore.toISOString(),
                     }
                   : {}),
+                ...(transientRetryDeferralCapPayload ?? {}),
                 ...(codexTransientFallbackMode
                   ? { codexTransientFallbackMode }
                   : {}),
@@ -14233,6 +14426,7 @@ export function heartbeatService(
                 transientRetryNotBefore.toISOString(),
             }
           : {}),
+        ...(transientRetryDeferralCapPayload ?? {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
       },
     });
@@ -14556,6 +14750,69 @@ export function heartbeatService(
     };
   }
 
+  /**
+   * Undo the dueness that retry-now manufactured, putting `accelerated` back on
+   * its original schedule.
+   *
+   * Only reachable when the promotion gate closed between the retry-now
+   * pre-flight and the promote itself. The retry-now audit stamps stay on the
+   * context snapshot — someone did ask — but `scheduledRetryAt` must go back,
+   * or the run sits due-and-suppressing and the scheduler cancels it on the
+   * next tick.
+   */
+  async function restoreParkedScheduledRetry(
+    accelerated: typeof heartbeatRuns.$inferSelect,
+    original: typeof heartbeatRuns.$inferSelect,
+    now: Date,
+  ) {
+    const originalRetryAt = original.scheduledRetryAt
+      ? new Date(original.scheduledRetryAt)
+      : null;
+    const originalRetryAtIso = originalRetryAt?.toISOString() ?? null;
+
+    return db.transaction(async (tx) => {
+      const row = await tx
+        .update(heartbeatRuns)
+        .set({
+          scheduledRetryAt: originalRetryAt,
+          contextSnapshot: {
+            ...parseObject(accelerated.contextSnapshot),
+            scheduledRetryAt: originalRetryAtIso,
+            retryNowSuppressedAt: now.toISOString(),
+          },
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.id, accelerated.id),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+          ),
+        )
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!row) return null;
+
+      if (row.wakeupRequestId) {
+        const payload = parseObject(
+          await tx
+            .select({ payload: agentWakeupRequests.payload })
+            .from(agentWakeupRequests)
+            .where(eq(agentWakeupRequests.id, row.wakeupRequestId))
+            .then((rows) => rows[0]?.payload ?? null),
+        );
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            payload: { ...payload, scheduledRetryAt: originalRetryAtIso },
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, row.wakeupRequestId));
+      }
+
+      return row;
+    });
+  }
+
   async function retryScheduledRetryNow(input: {
     issueId: string;
     actor?: {
@@ -14592,6 +14849,25 @@ export function heartbeatService(
         outcome: "no_scheduled_retry" as const,
         message: "No live scheduled retry exists for this issue",
         scheduledRetry: null,
+      };
+    }
+
+    // Evaluate the promotion gate *before* manufacturing dueness.
+    //
+    // Retry-now accelerates a retry by rewriting `scheduledRetryAt` to now.
+    // That write is what makes the run eligible for cancellation, because both
+    // `cancelScheduledRetryForGate` and the promote itself are guarded on
+    // `scheduledRetryAt <= now`. Evaluating the gate first means the steady
+    // suppressing case — a paused, walled or over-budget assignee, which is
+    // precisely the population whose retries are parked — leaves the retry
+    // untouched at its original time and performs no write at all.
+    const preflight = await blockingScheduledRetryGate(scheduled.run);
+    if (preflight) {
+      return {
+        outcome: "gate_suppressed" as const,
+        message: preflight.reason,
+        suppressedErrorCode: preflight.errorCode,
+        scheduledRetry: summarizeIssueScheduledRetryRun(scheduled),
       };
     }
 
@@ -14682,7 +14958,32 @@ export function heartbeatService(
       },
     });
 
-    const promotion = await promoteScheduledRetryRun(updated, now);
+    // `cancelOnGateSuppression: false` is what keeps this verb non-destructive.
+    // The pre-flight above already refused the steady suppressing case, so
+    // reaching suppression here means the gate closed between the two reads.
+    // Restore the park rather than cancelling it, otherwise the retry is left
+    // due-and-suppressing and the next scheduler tick finishes the job.
+    const promotion = await promoteScheduledRetryRun(updated, now, {
+      cancelOnGateSuppression: false,
+    });
+
+    if (promotion.outcome === "gate_suppressed") {
+      const restored = await restoreParkedScheduledRetry(
+        updated,
+        scheduled.run,
+        now,
+      );
+      return {
+        outcome: "gate_suppressed" as const,
+        message: promotion.reason,
+        suppressedErrorCode: promotion.errorCode,
+        scheduledRetry: summarizeIssueScheduledRetryRun({
+          run: restored ?? updated,
+          agentName: scheduled.agentName,
+        }),
+      };
+    }
+
     const promotedRow = await getIssueRetryRun(issue.companyId, issue.id, [
       "queued",
       "running",
@@ -14699,13 +15000,6 @@ export function heartbeatService(
       return {
         outcome: "promoted" as const,
         message: "Scheduled retry was promoted to the queued run pool",
-        scheduledRetry,
-      };
-    }
-    if (promotion.outcome === "gate_suppressed") {
-      return {
-        outcome: "gate_suppressed" as const,
-        message: promotion.reason,
         scheduledRetry,
       };
     }
@@ -21474,7 +21768,25 @@ export function heartbeatService(
             outcome === "failed" &&
             readTransientRecoveryContractFromRun(livenessRun)
           ) {
-            await scheduleBoundedRetryForRun(livenessRun, agent);
+            const transientRetryResult = await scheduleBoundedRetryForRun(
+              livenessRun,
+              agent,
+            );
+            if (transientRetryResult.outcome === "retry_exhausted") {
+              // Terminal abandonment. A live provider reset hint schedules a
+              // capped re-probe instead of reaching this arm, so exhaustion
+              // here means the failures are unexplained; the stranded-issue
+              // recovery classifier owns the issue's disposition from here.
+              logger.error(
+                {
+                  runId: livenessRun.id,
+                  issueId,
+                  attempt: transientRetryResult.attempt,
+                  maxAttempts: transientRetryResult.maxAttempts,
+                },
+                "bounded transient retry budget exhausted with no live provider reset hint; no further automatic retry will be queued",
+              );
+            }
           }
           const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
             livenessRun,
