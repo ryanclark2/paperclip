@@ -8612,6 +8612,230 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  // ── fleet_gated call sites (ALM-7532) ─────────────────────────────────────
+  // The classifier itself is unit-tested in
+  // services/recovery/continuation-classifier.test.ts. These drive the real sweep
+  // so the two call-site gates — and the bound on the inOutage=false arm — are
+  // exercised against the database rather than asserted in the abstract.
+
+  async function seedHealthySiblingRun(companyId: string) {
+    const siblingAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: siblingAgentId,
+      companyId,
+      name: "SiblingCoder",
+      role: "engineer",
+      status: "idle",
+      // Same adapterType as the stranded agent: this is what makes the run count
+      // as fleet evidence. createdAt defaults to now(), inside the 2h lookback.
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: siblingAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      // A different (non-existent) issue, so this run can never be selected as the
+      // stranded issue's latest run.
+      contextSnapshot: { issueId: randomUUID() },
+    });
+    return siblingAgentId;
+  }
+
+  it("holds an in_progress issue in place during a fleet auth outage instead of parking it", async () => {
+    const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "claude_auth_required",
+      runError: "Claude authentication required. Run `claude login`.",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    // The whole point of fleet_gated: never parked, never reassigned.
+    expect(issue?.status).toBe("in_progress");
+    expect(issue?.assigneeAgentId).toBe(agentId);
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(recoveryActions).toHaveLength(0);
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("fleet authentication outage");
+    expect(comments[0]?.body).toContain("fleet_auth_outage:claude_auth_required");
+
+    const followupRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(followupRuns.filter((row) => row.id !== runId)).toHaveLength(0);
+  });
+
+  it("posts at most one fleet-outage notice per issue across repeated sweeps", async () => {
+    const { issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "claude_auth_required",
+      runError: "Claude authentication required. Run `claude login`.",
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.reconcileStrandedAssignedIssues();
+    await heartbeat.reconcileStrandedAssignedIssues();
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    // An outage lasts hours and the sweep runs on a timer; without the dedupe
+    // window this is where the notice storm would be.
+    expect(comments).toHaveLength(1);
+  });
+
+  it("escalates the continuation instead of re-enqueuing when the fleet is healthy but this agent's auth still fails", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "claude_auth_required",
+      runError: "Claude authentication required. Run `claude login`.",
+    });
+    await seedHealthySiblingRun(companyId);
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("fleet adapter appears healthy");
+    expect(comments[0]?.body).toContain("`claude_auth_required`");
+
+    // The unbounded-loop regression this arm exists to prevent: falling through to
+    // enqueueStrandedIssueRecovery would requeue here on every sweep, forever.
+    const followupRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const continuationRetryRun = followupRuns.find((row) => {
+      const ctx = row.contextSnapshot as Record<string, unknown> | null;
+      return ctx?.retryReason === "issue_continuation_needed";
+    });
+    expect(continuationRetryRun).toBeUndefined();
+    for (const row of followupRuns) {
+      if (row.id !== runId) {
+        await waitForRunToSettle(heartbeat, row.id);
+      }
+    }
+  });
+
+  it("holds an assigned todo issue in place during a fleet auth outage", async () => {
+    const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+      retryReason: "assignment_recovery",
+      runErrorCode: "acpx_auth_required",
+      runError: "ACP authentication required.",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("todo");
+    expect(issue?.assigneeAgentId).toBe(agentId);
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("fleet_auth_outage:acpx_auth_required");
+
+    const followupRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(followupRuns.filter((row) => row.id !== runId)).toHaveLength(0);
+  });
+
+  it("escalates the todo dispatch instead of re-enqueuing when the fleet is healthy", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+      retryReason: "assignment_recovery",
+      runErrorCode: "acpx_auth_required",
+      runError: "ACP authentication required.",
+    });
+    await seedHealthySiblingRun(companyId);
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+    expect(result.dispatchRequeued).toBe(0);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("fleet adapter appears healthy");
+    expect(comments[0]?.body).toContain("`acpx_auth_required`");
+
+    const followupRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    for (const row of followupRuns) {
+      if (row.id !== runId) {
+        await waitForRunToSettle(heartbeat, row.id);
+      }
+    }
+  });
+
   it("leaves the productive-but-stranded continuation path unchanged under the new classifier", async () => {
     const { agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
