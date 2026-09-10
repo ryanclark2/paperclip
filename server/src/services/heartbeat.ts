@@ -17256,6 +17256,9 @@ export function heartbeatService(
           queuedIssueIds,
         );
       const companyAgents = await listCompanyAgentOrgRows(agent.companyId);
+      // One clock for the whole sort: reading it per run would let the age
+      // escape fire for some rows and not others inside a single dispatch.
+      const dispatchNowMs = Date.now();
       const prioritizedRuns = queuedRuns
         .map((run) => {
           const issueId = readNonEmptyString(
@@ -17274,6 +17277,9 @@ export function heartbeatService(
                 ? (dependencyReadiness.get(issueId)?.isDependencyReady ?? true)
                 : true,
               issueIdsBlockingOpenWork,
+              invocationSource: run.invocationSource,
+              scheduledRetryReason: run.scheduledRetryReason,
+              nowMs: dispatchNowMs,
             }),
           };
         })
