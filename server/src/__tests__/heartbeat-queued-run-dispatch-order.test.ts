@@ -24,6 +24,8 @@ function runKey(input: {
   priority?: string | null;
   dependencyReady?: boolean;
   blocking?: readonly string[];
+  invocationSource?: string | null;
+  scheduledRetryReason?: string | null;
 }): QueuedRunDispatchKey {
   const issueId = input.issueId === undefined ? `issue-${input.runId}` : input.issueId;
   return buildQueuedRunDispatchKey({
@@ -34,6 +36,16 @@ function runKey(input: {
     issuePriority: input.priority ?? "high",
     isDependencyReady: input.dependencyReady ?? true,
     issueIdsBlockingOpenWork: new Set(input.blocking ?? []),
+    // These cases predate the wake-class rank and assert the head-start,
+    // priority and readiness rules in isolation. Every run here shares one
+    // class, and `nowMs` is pinned to the run's own enqueue time so the age
+    // escape can never fire and vary it. That holds the class key constant
+    // across the whole file, which is what makes these 12 examples a
+    // regression control for the wake-class change: they pass only if the new
+    // key is a no-op when every run shares a class.
+    invocationSource: input.invocationSource ?? "automation",
+    scheduledRetryReason: input.scheduledRetryReason ?? null,
+    nowMs: NOW - input.ageMs,
   });
 }
 
@@ -52,6 +64,9 @@ function readinessRankFor(issueStatus: string | null | undefined): number {
     issuePriority: "high",
     isDependencyReady: true,
     issueIdsBlockingOpenWork: new Set<string>(),
+    invocationSource: "automation",
+    scheduledRetryReason: null,
+    nowMs: NOW,
   }).readinessRank;
 }
 
