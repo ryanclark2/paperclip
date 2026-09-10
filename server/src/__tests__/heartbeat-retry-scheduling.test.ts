@@ -2923,46 +2923,64 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       expect(artifacts.contextSnapshot).not.toHaveProperty("transientRetryDeferralCapMs");
     });
 
-    it("does not accept a truthy non-boolean attestation as a real parse", async () => {
-      // The attestation read is `=== true` on purpose. Relaxing it to
-      // Boolean(...) was 72/72 green at `b7a9161ca` because no producer emits
-      // a truthy non-boolean — but the flag is what buys the 6h horizon over the
-      // 2h probe cadence, so a laundered string would let an unparsed stamp
-      // steer a 6h deferral. A 4h hint sits between the two limits and is the
-      // only instant that can tell them apart (ALM-7805 R-A).
-      const companyId = randomUUID();
-      const agentId = randomUUID();
-      const runId = randomUUID();
-      const now = new Date("2026-09-04T12:00:00.000Z");
-      const hint = new Date(now.getTime() + 4 * 60 * 60 * 1000);
-      const cappedAt = new Date(now.getTime() + CAP_MS);
+    // Every value below is a truthy non-boolean, and no single one of them is
+    // sufficient. `"true"` and `"false"` kill `Boolean(...)` but NOT `== true`:
+    // a non-numeric string coerces to `NaN`, so `"true" == true` is false and
+    // the string AGREES with the shipped `=== true`, leaving the loosest
+    // relaxation of the guard invisible behind it. `1` disagrees with
+    // `=== true` under both `== true` and `Boolean(...)`, so it is the member
+    // of the class that kills the pair (ALM-7902 B1-r5). A fixture kills a
+    // mutant only when its value lands on the other side of that mutant from
+    // the original; picking any truthy non-boolean is not enough.
+    const TRUTHY_NON_BOOLEAN_ATTESTATIONS: [string, unknown][] = [
+      ['the string "true"', "true"],
+      ["the number 1", 1],
+      ['the string "false"', "false"],
+    ];
 
-      await seedRetryFixture({
-        runId,
-        companyId,
-        agentId,
-        now,
-        errorCode: "provider_quota",
-        errorFamily: "provider_quota",
-        adapterType: "claude_local",
-        retryNotBefore: hint.toISOString(),
-        retryResetTimeParsed: { raw: "true" },
-      });
+    it.each(TRUTHY_NON_BOOLEAN_ATTESTATIONS)(
+      "does not accept a truthy non-boolean attestation (%s) as a real parse",
+      async (_label, rawAttestation) => {
+        // The attestation read is `=== true` on purpose. Relaxing it to
+        // Boolean(...) was 72/72 green at `b7a9161ca` because no producer emits
+        // a truthy non-boolean — but the flag is what buys the 6h horizon over the
+        // 2h probe cadence, so a laundered string would let an unparsed stamp
+        // steer a 6h deferral. A 4h hint sits between the two limits and is the
+        // only instant that can tell them apart (ALM-7805 R-A).
+        const companyId = randomUUID();
+        const agentId = randomUUID();
+        const runId = randomUUID();
+        const now = new Date("2026-09-04T12:00:00.000Z");
+        const hint = new Date(now.getTime() + 4 * 60 * 60 * 1000);
+        const cappedAt = new Date(now.getTime() + CAP_MS);
 
-      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
-        now,
-        random: () => 0.5,
-      });
+        await seedRetryFixture({
+          runId,
+          companyId,
+          agentId,
+          now,
+          errorCode: "provider_quota",
+          errorFamily: "provider_quota",
+          adapterType: "claude_local",
+          retryNotBefore: hint.toISOString(),
+          retryResetTimeParsed: { raw: rawAttestation },
+        });
 
-      expect(scheduled.outcome).toBe("scheduled");
-      if (scheduled.outcome !== "scheduled") return;
-      expect(scheduled.dueAt.toISOString()).toBe(cappedAt.toISOString());
+        const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+          now,
+          random: () => 0.5,
+        });
 
-      const artifacts = await readScheduledRetryArtifacts(scheduled.run.id, runId);
-      expect(artifacts.scheduledRetryAt?.toISOString()).toBe(cappedAt.toISOString());
-      expect(artifacts.contextSnapshot.transientRetryDeferralCappedAt).toBe(cappedAt.toISOString());
-      expect(artifacts.contextSnapshot.transientRetryDeferralCapMs).toBe(CAP_MS);
-    });
+        expect(scheduled.outcome).toBe("scheduled");
+        if (scheduled.outcome !== "scheduled") return;
+        expect(scheduled.dueAt.toISOString()).toBe(cappedAt.toISOString());
+
+        const artifacts = await readScheduledRetryArtifacts(scheduled.run.id, runId);
+        expect(artifacts.scheduledRetryAt?.toISOString()).toBe(cappedAt.toISOString());
+        expect(artifacts.contextSnapshot.transientRetryDeferralCappedAt).toBe(cappedAt.toISOString());
+        expect(artifacts.contextSnapshot.transientRetryDeferralCapMs).toBe(CAP_MS);
+      },
+    );
 
     it("spaces every capped attempt at exactly now + cap while prior attempts accrue", async () => {
       // Prior attempts 1..3 (scheduling attempts 2..4) against a far hint.

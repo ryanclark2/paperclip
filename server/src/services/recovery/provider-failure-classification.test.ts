@@ -218,30 +218,43 @@ describe("classifyAdapterFailureForRecovery", () => {
     });
   });
 
-  it("does not accept a truthy non-boolean attestation as a real parse", () => {
-    // The attestation read is `=== true`. Relaxing it to Boolean(...) was
-    // 72/72 green at `b7a9161ca` because no producer emits a truthy
-    // non-boolean —
-    // but every non-empty string is truthy, so the relaxed read would
-    // attest a stamp carrying the literal "false" just as readily
-    // (ALM-7805 R-B).
-    const now = new Date("2026-09-04T20:00:00.000Z");
-    const classification = classifyAdapterFailureForRecovery({
-      errorCode: "provider_quota",
-      error: "Provider quota exceeded for this model.",
-      resultJson: {
-        retryNotBefore: "2026-09-09T16:00:00.000Z",
-        transientRetryNotBefore: "2026-09-09T16:00:00.000Z",
-        transientRetryResetTimeParsed: "true",
-      },
-    }, now);
+  // The heartbeat-side twin of this table carries the same reasoning:
+  // `"true"` and `"false"` kill `Boolean(...)` but not `== true`, because a
+  // non-numeric string coerces to `NaN` and so agrees with the shipped
+  // `=== true`. `1` is the member that kills both (ALM-7902 B1-r5).
+  const TRUTHY_NON_BOOLEAN_ATTESTATIONS: [string, unknown][] = [
+    ['the string "true"', "true"],
+    ["the number 1", 1],
+    ['the string "false"', "false"],
+  ];
 
-    expect(classification).toEqual({
-      kind: "provider_quota",
-      retryAt: new Date("2026-09-09T16:00:00.000Z"),
-      parsedResetTime: false,
-    });
-  });
+  it.each(TRUTHY_NON_BOOLEAN_ATTESTATIONS)(
+    "does not accept a truthy non-boolean attestation (%s) as a real parse",
+    (_label, rawAttestation) => {
+      // The attestation read is `=== true`. Relaxing it to Boolean(...) was
+      // 72/72 green at `b7a9161ca` because no producer emits a truthy
+      // non-boolean —
+      // but every non-empty string is truthy, so the relaxed read would
+      // attest a stamp carrying the literal "false" just as readily
+      // (ALM-7805 R-B).
+      const now = new Date("2026-09-04T20:00:00.000Z");
+      const classification = classifyAdapterFailureForRecovery({
+        errorCode: "provider_quota",
+        error: "Provider quota exceeded for this model.",
+        resultJson: {
+          retryNotBefore: "2026-09-09T16:00:00.000Z",
+          transientRetryNotBefore: "2026-09-09T16:00:00.000Z",
+          transientRetryResetTimeParsed: rawAttestation,
+        },
+      }, now);
+
+      expect(classification).toEqual({
+        kind: "provider_quota",
+        retryAt: new Date("2026-09-09T16:00:00.000Z"),
+        parsedResetTime: false,
+      });
+    },
+  );
 
   it("treats a stamp at exactly now as lapsed, not live", () => {
     // The liveness test is strictly `> now`. Relaxing it to `>= now` was
