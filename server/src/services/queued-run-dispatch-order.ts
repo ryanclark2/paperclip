@@ -25,20 +25,6 @@
 export const QUEUED_RUN_BLOCKING_HEAD_START_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Issue statuses that do not count as "open work" for the head start.
- *
- * Finishing a blocker can only wake a dependent that is still live, so a
- * blocker whose every dependent is parked or closed gets no head start. This is
- * the same exclusion list `listWakeableBlockedDependents` uses to decide
- * whether a resolved blocker wakes anyone.
- */
-export const OPEN_WORK_EXCLUDED_ISSUE_STATUSES = [
-  "backlog",
-  "done",
-  "cancelled",
-] as const;
-
-/**
  * Readiness bands, unchanged from the pre-extraction dispatcher. Note that a
  * run with no issue (2) outranks a run whose issue is not dependency-ready (3),
  * and that any `in_progress` run (0) outranks any merely-ready run (1).

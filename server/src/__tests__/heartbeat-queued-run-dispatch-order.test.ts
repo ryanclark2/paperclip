@@ -5,7 +5,6 @@ import {
   compareQueuedRunDispatchKeys,
   issueRunPriorityRank,
   sortQueuedRunDispatchKeys,
-  OPEN_WORK_EXCLUDED_ISSUE_STATUSES,
   QUEUED_RUN_BLOCKING_HEAD_START_MS,
   QUEUED_RUN_READINESS_RANK,
   type QueuedRunDispatchKey,
@@ -162,13 +161,15 @@ describe("queued-run dispatch ordering", () => {
       blocking: ["issue-not-ready"],
     });
     const readyPlainLow = runKey({
-      runId: "ready-plain-low",
+      runId: "b-ready-plain-low",
       ageMs: 0,
       status: "todo",
       priority: "low",
     });
+    // Alphabetizes last, so a collapsed readiness band cannot leave it in front
+    // by accident of the runId tiebreak.
     const inProgressPlainLow = runKey({
-      runId: "in-progress-plain-low",
+      runId: "c-in-progress-plain-low",
       ageMs: 0,
       status: "in_progress",
       priority: "low",
@@ -181,34 +182,37 @@ describe("queued-run dispatch ordering", () => {
         inProgressPlainLow,
       ]),
     ).toEqual([
-      "in-progress-plain-low",
-      "ready-plain-low",
+      "c-in-progress-plain-low",
+      "b-ready-plain-low",
       "not-ready-blocking-critical",
     ]);
   });
 
   it("gives a run with no issue no head start and leaves its readiness rank at 2", () => {
     const noIssue = runKey({
-      runId: "no-issue",
+      runId: "b-no-issue",
       ageMs: 0,
       issueId: null,
       // A non-empty blocking set must still not reach a run with no issue.
-      blocking: ["issue-in-progress-plain", "some-other-issue"],
+      blocking: ["issue-b-no-issue", "some-other-issue"],
     });
     expect(noIssue.blocksOpenWork).toBe(false);
     expect(noIssue.readinessRank).toBe(QUEUED_RUN_READINESS_RANK.noIssue);
 
-    const inProgressPlain = runKey({ runId: "in-progress-plain", ageMs: 0 });
-    const todoPlain = runKey({ runId: "todo-plain", ageMs: 0, status: "todo" });
+    // Ids alphabetize in the exact reverse of the expected order, so a
+    // collapsed readiness band falls through to the runId tiebreak and reverses
+    // this array rather than reproducing it by luck.
+    const inProgressPlain = runKey({ runId: "d-in-progress-plain", ageMs: 0 });
+    const todoPlain = runKey({ runId: "c-todo-plain", ageMs: 0, status: "todo" });
     const notReady = runKey({
-      runId: "not-ready",
+      runId: "a-not-ready",
       ageMs: 0,
       dependencyReady: false,
     });
 
     expect(
       dispatchOrder([notReady, noIssue, todoPlain, inProgressPlain]),
-    ).toEqual(["in-progress-plain", "todo-plain", "no-issue", "not-ready"]);
+    ).toEqual(["d-in-progress-plain", "c-todo-plain", "b-no-issue", "a-not-ready"]);
   });
 
   it("only grants the head start to the run whose own issue is in the blocking set", () => {
@@ -254,13 +258,14 @@ describe("queued-run dispatch ordering", () => {
 
     // Same rank means the head start still decides between them, and both stay
     // behind an in_progress run of identical age and priority.
-    const inProgress = runKey({ runId: "in-progress", ageMs: 0 });
-    const inReview = runKey({ runId: "in-review", ageMs: 0, status: "in_review" });
-    const blocked = runKey({ runId: "blocked", ageMs: 0, status: "blocked" });
+    // Ids deliberately alphabetize in the reverse of the expected order.
+    const inProgress = runKey({ runId: "c-in-progress", ageMs: 0 });
+    const inReview = runKey({ runId: "b-in-review", ageMs: 0, status: "in_review" });
+    const blocked = runKey({ runId: "a-blocked", ageMs: 0, status: "blocked" });
     expect(dispatchOrder([blocked, inReview, inProgress])).toEqual([
-      "in-progress",
-      "blocked",
-      "in-review",
+      "c-in-progress",
+      "a-blocked",
+      "b-in-review",
     ]);
   });
 
@@ -298,11 +303,6 @@ describe("queued-run dispatch ordering", () => {
     // Equality, not membership: a presence assertion is satisfied by a superset
     // and so cannot catch a widened list (ADR-004 Amendment 6).
     expect(QUEUED_RUN_BLOCKING_HEAD_START_MS).toBe(24 * 60 * 60 * 1000);
-    expect([...OPEN_WORK_EXCLUDED_ISSUE_STATUSES]).toEqual([
-      "backlog",
-      "done",
-      "cancelled",
-    ]);
     expect(QUEUED_RUN_READINESS_RANK).toEqual({
       inProgressAndReady: 0,
       ready: 1,
