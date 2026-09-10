@@ -599,6 +599,21 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
   30 * 60 * 1000,
   2 * 60 * 60 * 1000,
 ] as const;
+// Horizon below which a provider-printed retry-not-before hint is honoured
+// exactly. Session-class walls are near-total and their printed reset is
+// accurate (measured 2026-09-04: 109 failed dispatches vs 5 successes over
+// 8.5h, first success 5s after the printed reset), so parking short of the
+// reset only burns dispatches. Weekly-class resets sit days out and their
+// walls are intermittent, so a hint beyond this horizon must never set the
+// in-budget delay — it gets the probe cadence below instead.
+export const BOUNDED_TRANSIENT_HEARTBEAT_HINT_HONOR_HORIZON_MS =
+  6 * 60 * 60 * 1000;
+// Probe cadence for a hint beyond the honor horizon. Matches the last entry
+// of the backoff table: the scheduler already tolerates that gap between
+// attempts on its own, so a longer vendor wall gets re-probed once per cap
+// window while the transient retry budget lasts.
+export const BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS =
+  2 * 60 * 60 * 1000;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
@@ -875,6 +890,17 @@ function readTransientRetryNotBeforeFromRun(
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+// True only when the writer of the retry-not-before stamp attested that it
+// was parsed out of a real vendor error (adapter parse, or the recovery
+// classifier's clock-reset parse). Synthetic stamps — e.g. the recovery
+// classifier's fixed default backoff when nothing parseable exists — carry
+// `false`, and stamps persisted before the flag existed read as unproven.
+function readTransientRetryResetTimeParsedFromRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">,
+) {
+  return parseObject(run.resultJson).transientRetryResetTimeParsed === true;
+}
+
 function readTransientRecoveryContractFromRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
@@ -884,6 +910,7 @@ function readTransientRecoveryContractFromRun(
     ? {
         errorFamily,
         retryNotBefore: readTransientRetryNotBeforeFromRun(run),
+        resetTimeParsed: readTransientRetryResetTimeParsedFromRun(run),
       }
     : null;
 }
@@ -980,6 +1007,10 @@ function mergeAdapterRecoveryMetadata(input: {
       ? {
           retryNotBefore,
           transientRetryNotBefore: retryNotBefore,
+          // An adapter-reported retry-not-before is a parse of the vendor's
+          // own error by construction — this function only fires on values
+          // the adapter extracted and reported.
+          transientRetryResetTimeParsed: true,
           ...(errorFamily === "provider_quota"
             ? { providerQuotaRetryNotBefore: retryNotBefore }
             : {}),
@@ -13561,19 +13592,66 @@ export function heartbeatService(
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
+    const transientRetryResetTimeParsed =
+      transientRecovery?.resetTimeParsed ?? false;
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
 
-    if (!baseSchedule) {
+    // A provider-printed reset hint that is still in the future explains the
+    // failure only for part of the channel: an adapter-parsed (or recovery-
+    // classifier-parsed) stamp really is the vendor promising recovery at a
+    // known instant, but the same resultJson keys also carried synthetic
+    // default-backoff stamps that promise nothing (ALM-7596 B1-r2). So the
+    // budget must not abandon a run while a PROVEN promise is live — and
+    // must not probe forever either. The post-budget allowance is exactly
+    // one final park AT the printed reset (the promise as last resort, not a
+    // probe treadmill), taken only when the stamp's writer attested a real
+    // parse. The next failure after that park exhausts terminally, as does
+    // any hint that is unproven, absent, or already in the past.
+    const liveTransientResetHint =
+      transientRetryNotBefore &&
+      transientRetryNotBefore.getTime() > now.getTime()
+        ? transientRetryNotBefore
+        : null;
+    const finalHintParkDelayMs =
+      !baseSchedule &&
+      liveTransientResetHint &&
+      transientRetryResetTimeParsed &&
+      nextAttempt === maxAttempts + 1
+        ? Math.max(
+            1_000,
+            liveTransientResetHint.getTime() - now.getTime(),
+          )
+        : null;
+    const finalHintParkSchedule =
+      finalHintParkDelayMs !== null
+        ? {
+            attempt: nextAttempt,
+            baseDelayMs: finalHintParkDelayMs,
+            delayMs: finalHintParkDelayMs,
+            dueAt: new Date(now.getTime() + finalHintParkDelayMs),
+            maxAttempts,
+          }
+        : null;
+    const effectiveBaseSchedule = baseSchedule ?? finalHintParkSchedule;
+
+    if (!effectiveBaseSchedule) {
       await appendRunEvent(run, {
         eventType: "lifecycle",
         stream: "system",
-        level: "warn",
+        level:
+          retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
+            ? "error"
+            : "warn",
         message: `Bounded retry exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts; no further automatic retry will be queued`,
         payload: {
           retryReason,
           scheduledRetryAttempt: run.scheduledRetryAttempt ?? 0,
           maxAttempts,
+          issueId,
+          transientRetryNotBefore:
+            transientRetryNotBefore?.toISOString() ?? null,
+          transientRetryResetTimeParsed,
         },
       });
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
@@ -13597,6 +13675,24 @@ export function heartbeatService(
         attempt: nextAttempt,
         maxAttempts,
       };
+    }
+
+    if (finalHintParkSchedule) {
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: `Bounded retry budget exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts, but a parsed provider reset hint is still ahead; taking one final park at the printed reset instead of abandoning the run`,
+        payload: {
+          retryReason,
+          scheduledRetryAttempt: nextAttempt,
+          maxAttempts,
+          issueId,
+          transientRetryNotBefore:
+            liveTransientResetHint?.toISOString() ?? null,
+          scheduledRetryAt: finalHintParkSchedule.dueAt.toISOString(),
+        },
+      });
     }
 
     if (retryReason !== MAX_TURN_CONTINUATION_RETRY_REASON) {
@@ -13627,18 +13723,62 @@ export function heartbeatService(
       }
     }
 
+    const providerDeferralCapAt = new Date(
+      now.getTime() + BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS,
+    );
+    const hintHonorHorizonAt = new Date(
+      now.getTime() + BOUNDED_TRANSIENT_HEARTBEAT_HINT_HONOR_HORIZON_MS,
+    );
+    // Explicit boolean rather than reference identity, so the signal survives
+    // a refactor that rebuilds the Date object in either branch.
+    // A hint at or inside the honor horizon is honoured exactly (session-
+    // class walls are near-total; parking short of the printed reset only
+    // burns dispatches) — but the horizon is earned by the writer's parse
+    // attestation. An unproven stamp (attested false, or written before the
+    // attestation flag existed — every pre-existing heartbeat_runs row) only
+    // ever gets the probe-cadence cap: the horizon is a raise over the cap
+    // those rows were written under, and extending it to stamps nobody
+    // parsed would let legacy rows steer a 6h deferral. A hint beyond its
+    // honor limit is capped down to the probe cadence. The final post-budget
+    // park is naturally exempt: its dueAt is the printed reset itself, later
+    // than the capped instant, so the later-wins selection below keeps it.
+    const transientRetryHintHonorLimitAt = transientRetryResetTimeParsed
+      ? hintHonorHorizonAt
+      : providerDeferralCapAt;
+    const transientRetryDeferralWasCapped =
+      transientRetryNotBefore != null &&
+      transientRetryNotBefore.getTime() >
+        transientRetryHintHonorLimitAt.getTime();
+    const cappedTransientRetryNotBefore = transientRetryDeferralWasCapped
+      ? providerDeferralCapAt
+      : transientRetryNotBefore;
     const schedule =
-      transientRetryNotBefore &&
-      transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      cappedTransientRetryNotBefore &&
+      cappedTransientRetryNotBefore.getTime() >
+        effectiveBaseSchedule.dueAt.getTime()
         ? {
-            ...baseSchedule,
-            dueAt: transientRetryNotBefore,
+            ...effectiveBaseSchedule,
+            dueAt: cappedTransientRetryNotBefore,
             delayMs: Math.max(
               0,
-              transientRetryNotBefore.getTime() - now.getTime(),
+              cappedTransientRetryNotBefore.getTime() - now.getTime(),
             ),
           }
-        : baseSchedule;
+        : effectiveBaseSchedule;
+    // Emitted only when the capped instant is the instant the scheduler
+    // actually uses. A truncated hint that then loses the max() against the
+    // jittered backoff did not bind the outcome, and naming it would
+    // advertise an instant the scheduler ignores. When present,
+    // transientRetryDeferralCappedAt always equals scheduledRetryAt.
+    const transientRetryDeferralCapPayload =
+      transientRetryDeferralWasCapped &&
+      schedule.dueAt.getTime() === providerDeferralCapAt.getTime()
+        ? {
+            transientRetryDeferralCappedAt: providerDeferralCapAt.toISOString(),
+            transientRetryDeferralCapMs:
+              BOUNDED_TRANSIENT_HEARTBEAT_PROVIDER_DEFERRAL_CAP_MS,
+          }
+        : null;
 
     const requiresIssueGate =
       retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
@@ -13737,6 +13877,7 @@ export function heartbeatService(
                 transientRetryNotBefore.toISOString(),
             }
           : {}),
+        ...(transientRetryDeferralCapPayload ?? {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
       },
       "normal_model",
@@ -14029,6 +14170,7 @@ export function heartbeatService(
                         transientRetryNotBefore.toISOString(),
                     }
                   : {}),
+                ...(transientRetryDeferralCapPayload ?? {}),
                 ...(codexTransientFallbackMode
                   ? { codexTransientFallbackMode }
                   : {}),
@@ -14280,6 +14422,7 @@ export function heartbeatService(
                 transientRetryNotBefore.toISOString(),
             }
           : {}),
+        ...(transientRetryDeferralCapPayload ?? {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
       },
     });
@@ -21648,7 +21791,25 @@ export function heartbeatService(
             outcome === "failed" &&
             readTransientRecoveryContractFromRun(livenessRun)
           ) {
-            await scheduleBoundedRetryForRun(livenessRun, agent);
+            const transientRetryResult = await scheduleBoundedRetryForRun(
+              livenessRun,
+              agent,
+            );
+            if (transientRetryResult.outcome === "retry_exhausted") {
+              // Terminal abandonment. A live provider reset hint schedules a
+              // capped re-probe instead of reaching this arm, so exhaustion
+              // here means the failures are unexplained; the stranded-issue
+              // recovery classifier owns the issue's disposition from here.
+              logger.error(
+                {
+                  runId: livenessRun.id,
+                  issueId,
+                  attempt: transientRetryResult.attempt,
+                  maxAttempts: transientRetryResult.maxAttempts,
+                },
+                "bounded transient retry budget exhausted with no live provider reset hint; no further automatic retry will be queued",
+              );
+            }
           }
           const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
             livenessRun,
