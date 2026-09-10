@@ -92,12 +92,6 @@ export interface QueuedRunDispatchKey {
   effectiveWakeClassRank: number;
   /** The run waited past QUEUED_RUN_CLASS_AGE_ESCAPE_MS and was promoted. */
   ageEscaped: boolean;
-  /**
-   * The run's issue is not dependency-ready. Hoisted out of `readinessRank` so
-   * it can be checked ahead of the wake class: a run that cannot make progress
-   * must stay last no matter how urgent its class is.
-   */
-  dependencyNotReady: boolean;
 }
 
 export function issueRunPriorityRank(priority: string | null | undefined) {
@@ -175,8 +169,6 @@ export function buildQueuedRunDispatchKey(input: {
     effectiveWakeClassRank: ageEscaped
       ? QUEUED_RUN_WAKE_CLASS_RANK.assignment
       : wakeClassRank,
-    dependencyNotReady:
-      readinessRank === QUEUED_RUN_READINESS_RANK.dependencyNotReady,
     priorityRank: issueRunPriorityRank(input.issuePriority),
     createdAtMs: input.createdAtMs,
     // A run with no issue can never block anything, so it can never take the
@@ -185,6 +177,14 @@ export function buildQueuedRunDispatchKey(input: {
       ? input.issueIdsBlockingOpenWork.has(input.issueId)
       : false,
   };
+}
+
+/**
+ * The run's issue is not dependency-ready. Read out of the readiness rank
+ * rather than stored alongside it, so the two can never disagree.
+ */
+function queuedRunIsDependencyBlocked(key: QueuedRunDispatchKey): boolean {
+  return key.readinessRank === QUEUED_RUN_READINESS_RANK.dependencyNotReady;
 }
 
 /** The enqueue time the ordering actually uses, after the head start. */
@@ -209,8 +209,10 @@ export function compareQueuedRunDispatchKeys(
   // Ahead of the wake class: dispatching a run whose issue is not
   // dependency-ready burns a slot on work that cannot proceed, and no class is
   // urgent enough to be worth that.
-  if (left.dependencyNotReady !== right.dependencyNotReady)
-    return left.dependencyNotReady ? 1 : -1;
+  const leftDependencyBlocked = queuedRunIsDependencyBlocked(left);
+  const rightDependencyBlocked = queuedRunIsDependencyBlocked(right);
+  if (leftDependencyBlocked !== rightDependencyBlocked)
+    return leftDependencyBlocked ? 1 : -1;
   if (left.effectiveWakeClassRank !== right.effectiveWakeClassRank)
     return left.effectiveWakeClassRank - right.effectiveWakeClassRank;
   if (left.readinessRank !== right.readinessRank)

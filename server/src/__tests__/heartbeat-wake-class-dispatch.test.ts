@@ -454,6 +454,11 @@ describeEmbeddedPostgres("queued-run wake-class rank, end to end", () => {
     // the opposite outcome, so the only thing that can produce it is the age.
     // A mutant that drops the escape, or reads a clock per run instead of the
     // one dispatch clock, leaves the assignment wake claimed.
+    //
+    // On its own this case is NOT evidence: pre-change FIFO also serves the
+    // older run, so it is green at the base SHA. Its twin below is what makes
+    // the pair discriminating — same two classes, one minute of age apart,
+    // opposite winners.
     const result = await claimWinner({
       ...PARKED_RETRY,
       olderAgeMs: 6 * HOUR_MS + MINUTE_MS,
@@ -461,5 +466,19 @@ describeEmbeddedPostgres("queued-run wake-class rank, end to end", () => {
     });
     expect(result.winner).toBe("older");
     expect(result.newerStatus).toBe("queued");
+  }, 60_000);
+
+  it("claims the assignment wake when the retry is one minute short of the threshold", async () => {
+    // The other side of the boundary, and the half that is red at the base SHA.
+    // Together with the case above it brackets the escape at the dispatcher
+    // level: a mutant that widens the window past 6h, or narrows it, flips
+    // exactly one of the two.
+    const result = await claimWinner({
+      ...PARKED_RETRY,
+      olderAgeMs: 6 * HOUR_MS - MINUTE_MS,
+      ...ASSIGNMENT,
+    });
+    expect(result.winner).toBe("newer");
+    expect(result.olderStatus).toBe("queued");
   }, 60_000);
 });

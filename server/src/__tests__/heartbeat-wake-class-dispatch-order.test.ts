@@ -156,8 +156,12 @@ describe("wake-class rank", () => {
     });
     const readyRetry = parkedRetry("b-ready-retry", 4 * HOUR);
 
-    expect(blockedAssignment.dependencyNotReady).toBe(true);
-    expect(readyRetry.dependencyNotReady).toBe(false);
+    expect(blockedAssignment.readinessRank).toBe(
+      QUEUED_RUN_READINESS_RANK.dependencyNotReady,
+    );
+    expect(readyRetry.readinessRank).not.toBe(
+      QUEUED_RUN_READINESS_RANK.dependencyNotReady,
+    );
     expect(dispatchOrder([blockedAssignment, readyRetry])).toEqual([
       "b-ready-retry",
       "a-blocked-assignment",
