@@ -3,6 +3,7 @@ import {
   buildQueuedRunDispatchKey,
   sortQueuedRunDispatchKeys,
   issueRunPriorityRank,
+  QUEUED_RUN_BLOCKING_HEAD_START_MS,
   QUEUED_RUN_CLASS_AGE_ESCAPE_MS,
   QUEUED_RUN_READINESS_RANK,
   QUEUED_RUN_WAKE_CLASS_RANK,
@@ -241,9 +242,13 @@ describe("wake-class rank: inputs the ordering must not change", () => {
    * the new ordering must be the old ordering element for element.
    */
   function referenceOrder(keys: readonly QueuedRunDispatchKey[]): string[] {
-    const HEAD_START = 24 * 60 * 60 * 1000;
+    // Imported, not hardcoded to 24h. The claim under test is "the class key is
+    // a no-op when the class does not vary" — not "the head start is 24h". If
+    // that constant is ever retuned, both sides must move together, or this
+    // fixture goes red for a reason that has nothing to do with what it checks.
     const orderingTime = (key: QueuedRunDispatchKey) =>
-      key.createdAtMs - (key.blocksOpenWork ? HEAD_START : 0);
+      key.createdAtMs -
+      (key.blocksOpenWork ? QUEUED_RUN_BLOCKING_HEAD_START_MS : 0);
     return [...keys]
       .sort((left, right) => {
         if (left.readinessRank !== right.readinessRank)
