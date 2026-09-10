@@ -962,6 +962,42 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     );
   }
 
+  // Both fleet_gated call sites reach the same two conclusions, so the policy lives
+  // here once rather than being copied into each sweep where the two could drift.
+  async function resolveFleetGatedAuthFailure(input: {
+    issue: typeof issues.$inferSelect;
+    previousStatus: StrandedPreviousStatus;
+    agentId: string;
+    latestRun: LatestIssueRun;
+    errorCode: string;
+  }): Promise<"escalated" | "skipped"> {
+    if (await isFleetAdapterInAuthOutage(input.issue.companyId, input.agentId, input.errorCode)) {
+      // Fleet-wide auth outage: never park and never reassign. The issue keeps its
+      // assignee and resumes on a later sweep once credentials return.
+      await maybePostFleetAuthOutageNotice(input.issue.id, input.errorCode);
+      return "skipped";
+    }
+    // Fleet healthy (a sibling succeeded) but this agent's auth still fails — a
+    // per-agent credential problem. Escalate: bounded and visible, the same shape as
+    // the default bucket. Falling through to enqueueStrandedIssueRecovery instead
+    // would re-enqueue on every sweep with no attempt cap, no backoff and no
+    // board-visible signal.
+    const updated = await escalateStrandedAssignedIssue({
+      issue: input.issue,
+      previousStatus: input.previousStatus,
+      latestRun: input.latestRun,
+      notice: {
+        body:
+          "The fleet adapter appears healthy (a sibling agent succeeded recently) but this " +
+          `agent's auth is still failing (\`${input.errorCode}\`). ` +
+          "This is likely a per-agent credential issue. Moving it to `blocked` for intervention.",
+        title: "Per-agent auth failure",
+        tone: "danger",
+      },
+    });
+    return updated ? "escalated" : "skipped";
+  }
+
   async function hasActiveExecutionPath(companyId: string, issueId: string, agentId?: string | null) {
     const [run, deferredWake] = await Promise.all([
       db
@@ -4117,30 +4153,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         if (didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
           const todoErrorCode = readNonEmptyString(latestRun?.errorCode);
           if (todoErrorCode && FLEET_GATED_CONTINUATION_ERROR_CODES.has(todoErrorCode)) {
-            if (await isFleetAdapterInAuthOutage(issue.companyId, agentId, todoErrorCode)) {
-              // Fleet-wide auth outage: never park and never reassign. The issue keeps
-              // its assignee and resumes on a later sweep once credentials return.
-              await maybePostFleetAuthOutageNotice(issue.id, todoErrorCode);
-              result.skipped += 1;
-              continue;
-            }
-            // Fleet healthy (a sibling succeeded) but this agent's auth still fails —
-            // a per-agent credential problem. Escalate: bounded and visible. Falling
-            // through to the dispatch requeue below would retry every sweep forever.
-            const updatedFleetGatedTodo = await escalateStrandedAssignedIssue({
+            const outcome = await resolveFleetGatedAuthFailure({
               issue,
               previousStatus: "todo",
+              agentId,
               latestRun,
-              notice: {
-                body:
-                  "The fleet adapter appears healthy (a sibling agent succeeded recently) but this " +
-                  `agent's auth is still failing (\`${todoErrorCode}\`). ` +
-                  "This is likely a per-agent credential issue. Moving it to `blocked` for intervention.",
-                title: "Per-agent auth failure",
-                tone: "danger",
-              },
+              errorCode: todoErrorCode,
             });
-            if (updatedFleetGatedTodo) {
+            if (outcome === "escalated") {
               result.escalated += 1;
               result.issueIds.push(issue.id);
             } else {
@@ -4347,33 +4367,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         if (classification.kind === "fleet_gated" && classification.errorCode) {
-          const fleetErrorCode = classification.errorCode;
-          if (await isFleetAdapterInAuthOutage(issue.companyId, agentId, fleetErrorCode)) {
-            // Fleet-wide auth outage: never park and never reassign. The issue keeps
-            // its assignee and resumes on a later sweep once credentials return.
-            await maybePostFleetAuthOutageNotice(issue.id, fleetErrorCode);
-            result.skipped += 1;
-            continue;
-          }
-          // Fleet healthy (a sibling succeeded) but this agent's auth still fails —
-          // a per-agent credential problem. Escalate: bounded and visible, the same
-          // shape as the default bucket. Falling through to enqueueStrandedIssueRecovery
-          // here would re-enqueue on every sweep with no attempt cap, no backoff and
-          // no board-visible signal.
-          const updatedFleetGated = await escalateStrandedAssignedIssue({
+          const outcome = await resolveFleetGatedAuthFailure({
             issue,
             previousStatus: "in_progress",
+            agentId,
             latestRun,
-            notice: {
-              body:
-                "The fleet adapter appears healthy (a sibling agent succeeded recently) but this " +
-                `agent's auth is still failing (\`${fleetErrorCode}\`). ` +
-                "This is likely a per-agent credential issue. Moving it to `blocked` for intervention.",
-              title: "Per-agent auth failure",
-              tone: "danger",
-            },
+            errorCode: classification.errorCode,
           });
-          if (updatedFleetGated) {
+          if (outcome === "escalated") {
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
