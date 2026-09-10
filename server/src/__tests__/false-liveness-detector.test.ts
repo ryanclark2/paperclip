@@ -6,6 +6,7 @@ import {
   falseLivenessStreak,
   hasProviderUsageRecord,
   isFalseLivenessRun,
+  PROVIDER_USAGE_MEASURE_KEYS,
   reportsZeroProviderUsage,
   resolveFalseLivenessEscalation,
   tripsFalseLivenessDetector,
@@ -96,6 +97,21 @@ describe("false-liveness predicate", () => {
     expect(isFalseLivenessRun(dead())).toBe(true);
   });
 
+  // The measure list, pinned by EQUALITY. The per-key fixtures below are all
+  // removals, and a removal probe cannot falsify a membership guard: `some`
+  // and `every` are both satisfied by a SUPERSET, so appending a key (e.g.
+  // "cacheAdjustedCostUsd", which heartbeat.ts really writes) left the whole
+  // suite green. Equality terminates the class; a battery of negatives does
+  // not. ADR-004 Amendment 6.
+  it("reads exactly these provider usage measures, in this order", () => {
+    expect(PROVIDER_USAGE_MEASURE_KEYS).toEqual([
+      "rawInputTokens",
+      "rawOutputTokens",
+      "rawCachedInputTokens",
+      "costUsd",
+    ]);
+  });
+
   // Pins each measure INDIVIDUALLY. Dropping any one key from the guard's key
   // list must be caught, so each key gets a fixture where it alone is non-zero.
   it.each([
@@ -126,6 +142,10 @@ describe("false-liveness predicate", () => {
     ["undefined", undefined],
     ["empty object", {}],
     ["an object with no measures", { model: "x", biller: "y" }],
+    // The sharp one: zero-valued keys shaped exactly like measures, but
+    // normalized rather than raw. Adding either to the measure list would
+    // flip this to true and put every session_delta agent one run from error.
+    ["only zero-valued non-measure keys", { inputTokens: 0, outputTokens: 0 }],
   ])("carries no usage record when usageJson is %s", (_label, usageJson) => {
     expect(hasProviderUsageRecord(usageJson as never)).toBe(false);
     expect(reportsZeroProviderUsage(usageJson as never)).toBe(false);
@@ -337,10 +357,31 @@ describe("false-liveness escalation", () => {
     ).toBe(true);
   });
 
-  it("names the fault as a credential/config problem, not a generic error", () => {
-    expect(FALSE_LIVENESS_ERROR_REASON).toMatch(/credential/i);
-    expect(FALSE_LIVENESS_ERROR_REASON).toMatch(/config/i);
+  // Equality, not presence. `toMatch(/credential/i)` is satisfied by any
+  // superset, so rewriting the leading bytes to "Run failure: " left the old
+  // assertions green while breaking the reversal path below. Equality also
+  // pins the ${FALSE_LIVENESS_STREAK_THRESHOLD} interpolation, so a threshold
+  // change cannot silently leave the operator-facing text saying "5".
+  it("stores this exact operator-facing reason", () => {
+    expect(FALSE_LIVENESS_ERROR_REASON).toBe(
+      "Adapter credential/config fault: the last 5 runs exited cleanly but " +
+        "the provider reported no tokens and no cost, so the model never " +
+        "ran. Check this agent's adapter credentials and configuration.",
+    );
     // agents.error_reason is truncated at 500 chars by the caller.
     expect(FALSE_LIVENESS_ERROR_REASON.length).toBeLessThanOrEqual(500);
+  });
+
+  // Kept separate from the equality above on purpose: these leading bytes are
+  // the ADR-004 control-3 reversal path, not prose. class-b-dry-run §D undoes
+  // a bad run with
+  //   UPDATE agents SET status='idle', error_reason=NULL
+  //   WHERE error_reason LIKE 'Adapter credential/config fault:%'
+  // so an edit that rewrites the message tail must not quietly take the
+  // prefix with it.
+  it("keys the documented bulk-undo prefix", () => {
+    expect(
+      FALSE_LIVENESS_ERROR_REASON.startsWith("Adapter credential/config fault: "),
+    ).toBe(true);
   });
 });

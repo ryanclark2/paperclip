@@ -427,7 +427,7 @@ export const FALSE_LIVENESS_ERROR_REASON =
  * and real cost. A detector reading the normalized counters would mark those
  * agents unavailable.
  */
-const PROVIDER_USAGE_MEASURE_KEYS = [
+export const PROVIDER_USAGE_MEASURE_KEYS = [
   "rawInputTokens",
   "rawOutputTokens",
   "rawCachedInputTokens",
