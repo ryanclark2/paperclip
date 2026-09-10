@@ -4491,6 +4491,51 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
   }, 0);
 }
 
+/**
+ * Issue statuses that do not count as "open work".
+ *
+ * A blocker whose every dependent is parked or closed is not holding anything
+ * up. Same status list `listWakeableBlockedDependents` applies below — note it
+ * additionally requires the dependent to have an assignee, so this set is the
+ * wider of the two.
+ */
+export const OPEN_WORK_EXCLUDED_ISSUE_STATUSES = [
+  "backlog",
+  "done",
+  "cancelled",
+] as const;
+
+/**
+ * Of `issueIds`, the subset that blocks at least one issue that is still open
+ * work.
+ *
+ * Direction: "X blocks Y" is stored as issueId = X (the blocker) and
+ * relatedIssueId = Y (the dependent), so the join walks relatedIssueId to reach
+ * the dependent and selects issueId back out — the same shape
+ * `listWakeableBlockedDependents` uses.
+ */
+export async function listIssueIdsBlockingOpenWork(
+  db: Db,
+  companyId: string,
+  issueIds: string[],
+): Promise<Set<string>> {
+  if (issueIds.length === 0) return new Set<string>();
+  const rows = await db
+    .select({ blockerIssueId: issueRelations.issueId })
+    .from(issueRelations)
+    .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
+    .where(
+      and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.type, "blocks"),
+        inArray(issueRelations.issueId, issueIds),
+        eq(issues.companyId, companyId),
+        notInArray(issues.status, [...OPEN_WORK_EXCLUDED_ISSUE_STATUSES]),
+      ),
+    );
+  return new Set(rows.map((row) => row.blockerIssueId));
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -6633,6 +6678,15 @@ export function issueService(db: Db) {
     ) => {
       return listIssueProductivityReviewMap(dbOrTx, companyId, sourceIssueIds);
     },
+
+    /**
+     * Of `issueIds`, the subset that blocks at least one issue that is still
+     * open work. Feeds the queued-run dispatch head start in ./heartbeat.js.
+     */
+    listIssueIdsBlockingOpenWork: async (
+      companyId: string,
+      issueIds: string[],
+    ) => listIssueIdsBlockingOpenWork(db, companyId, issueIds),
 
     listWakeableBlockedDependents: async (blockerIssueId: string) => {
       const blockerIssue = await db
