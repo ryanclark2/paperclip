@@ -567,3 +567,117 @@ describe("parseClaudeStreamJson usage extraction", () => {
     expect(parsed.usageBasis).toBe("per_run");
   });
 });
+
+// ALM-7533 / ALM-6309: the Claude CLI emits a machine-readable `rate_limit_event`
+// carrying the reset instant as a Unix timestamp. Prefer it over the printed clock
+// time — it needs no timezone inference and no prose shape at all.
+//
+// Live relevance (measured 2026-09-25 against the control-plane DB): of 63,148
+// heartbeat runs that failed with a weekly-limit refusal, 0 ever carried an
+// attested parsed reset time, because the weekly message prints a *date* form
+// ("resets Sep 16 at 9am") that both prose parsers reject. The epoch does not
+// care about the prose shape.
+describe("extractClaudeRetryNotBefore rate_limit_event epoch", () => {
+  // resetsAt 1788360600 == 2026-09-02T14:50:00Z (verbatim shape from run
+  // 258c9b56-a73c-49bd-aea2-aaefff6e5233 stdout).
+  const EPOCH_SECONDS = 1_788_360_600;
+  const EPOCH_ISO = "2026-09-02T14:50:00.000Z";
+  const NOW = new Date("2026-09-02T14:32:00.000Z");
+
+  const event = (info: Record<string, unknown>) =>
+    JSON.stringify({ type: "rate_limit_event", rate_limit_info: info });
+
+  it("prefers the epoch over a parseable prose clock time that disagrees", () => {
+    // The prose alone would give 06:50Z; a fixture where both agree could not
+    // pin which source was used.
+    const stdout = [
+      '{"type":"system","subtype":"init","session_id":"50412f56"}',
+      event({ status: "rejected", resetsAt: EPOCH_SECONDS, rateLimitType: "five_hour", overageStatus: "rejected" }),
+      '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"You\'ve hit your session limit · resets 11:50pm (America/Los_Angeles)"}',
+    ].join("\n");
+    expect(
+      extractClaudeRetryNotBefore(
+        { stdout, errorMessage: "Claude run failed: subtype=success: You've hit your session limit · resets 11:50pm (America/Los_Angeles)" },
+        NOW,
+      )?.toISOString(),
+    ).toBe(EPOCH_ISO);
+  });
+
+  it("reads the epoch for a seven_day refusal whose prose date form no prose parser accepts", () => {
+    // The live weekly shape. Prose yields null on master, so the epoch is the
+    // only possible source of a non-null answer here.
+    const weeklyProse = "Claude run failed: subtype=success: You've hit your weekly limit · resets Sep 16 at 9am (America/Los_Angeles)";
+    expect(extractClaudeRetryNotBefore({ errorMessage: weeklyProse }, NOW)).toBeNull();
+    const stdout = [
+      event({ status: "rejected", resetsAt: EPOCH_SECONDS, rateLimitType: "seven_day" }),
+      `{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":${JSON.stringify(weeklyProse)}}`,
+    ].join("\n");
+    expect(
+      extractClaudeRetryNotBefore({ stdout, errorMessage: weeklyProse }, NOW)?.toISOString(),
+    ).toBe(EPOCH_ISO);
+  });
+
+  it("accepts a rejection signalled only by overageStatus", () => {
+    const stdout = event({ status: "allowed", overageStatus: "rejected", resetsAt: EPOCH_SECONDS });
+    expect(extractClaudeRetryNotBefore({ stdout }, NOW)?.toISOString()).toBe(EPOCH_ISO);
+  });
+
+  it("ignores a non-rejection event, including the real allowed_warning shape", () => {
+    // Verbatim status from run 83f1e734: a seven_day warning carrying a real
+    // epoch. Honouring it would defer a run the provider never refused.
+    for (const info of [
+      { status: "allowed", resetsAt: EPOCH_SECONDS, rateLimitType: "five_hour" },
+      { status: "allowed_warning", resetsAt: EPOCH_SECONDS, rateLimitType: "seven_day" },
+    ]) {
+      expect(extractClaudeRetryNotBefore({ stdout: event(info) }, NOW)).toBeNull();
+    }
+  });
+
+  it("ignores an epoch that has already passed", () => {
+    const stdout = event({ status: "rejected", resetsAt: EPOCH_SECONDS });
+    expect(extractClaudeRetryNotBefore({ stdout }, new Date("2026-09-02T14:50:00.000Z"))).toBeNull();
+    expect(extractClaudeRetryNotBefore({ stdout }, new Date("2026-09-03T00:00:00.000Z"))).toBeNull();
+  });
+
+  it("ignores a missing, zero, or non-numeric epoch", () => {
+    for (const info of [
+      { status: "rejected", rateLimitType: "five_hour" },
+      { status: "rejected", resetsAt: 0 },
+      { status: "rejected", resetsAt: "soon" },
+    ]) {
+      expect(extractClaudeRetryNotBefore({ stdout: event(info) }, NOW)).toBeNull();
+    }
+  });
+
+  it("tolerates a millisecond epoch from a future CLI", () => {
+    const stdout = event({ status: "rejected", resetsAt: EPOCH_SECONDS * 1000 });
+    expect(extractClaudeRetryNotBefore({ stdout }, NOW)?.toISOString()).toBe(EPOCH_ISO);
+  });
+
+  it("takes the latest epoch when several rejection events are present", () => {
+    const stdout = [
+      event({ status: "rejected", resetsAt: EPOCH_SECONDS }),
+      event({ status: "rejected", resetsAt: EPOCH_SECONDS + 3_600 }),
+      event({ status: "rejected", resetsAt: EPOCH_SECONDS + 600 }),
+    ].join("\n");
+    expect(extractClaudeRetryNotBefore({ stdout }, NOW)?.toISOString()).toBe("2026-09-02T15:50:00.000Z");
+  });
+
+  it("ignores a line that merely mentions rate_limit_event without being one", () => {
+    const stdout = [
+      '{"type":"assistant","message":{"content":"a rate_limit_event has resetsAt 1788360600"}}',
+      '{"type":"stream_error","detail":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1788360600}}',
+      "rate_limit_event but not json at all",
+    ].join("\n");
+    expect(extractClaudeRetryNotBefore({ stdout }, NOW)).toBeNull();
+  });
+
+  it("still falls back to the prose clock time when no event is present", () => {
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "Claude run failed: subtype=success: You've hit your session limit · resets 5:30am (America/Los_Angeles)" },
+        new Date("2026-09-11T03:57:35.540Z"),
+      )?.toISOString(),
+    ).toBe("2026-09-11T12:30:00.000Z");
+  });
+});

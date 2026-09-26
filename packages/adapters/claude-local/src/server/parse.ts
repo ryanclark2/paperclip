@@ -498,6 +498,41 @@ function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: 
   return retryAt;
 }
 
+// The Claude CLI emits a machine-readable `rate_limit_event` alongside the prose
+// refusal, carrying the exact reset instant as a Unix timestamp. Prefer it over the
+// printed clock time: it needs no timezone inference and no prose shape at all.
+//
+// The prose shape matters more than it looks. A weekly refusal prints a *date* form
+// ("resets Sep 16 at 9am") that both `parseClaudeResetClockTime` here and
+// `parseProviderQuotaClockReset` in the recovery service reject, because both
+// require digits immediately after "resets". An epoch is immune to that.
+function extractClaudeRateLimitResetsAt(haystack: string, now: Date): Date | null {
+  let latest: Date | null = null;
+  for (const line of haystack.split(/\r?\n/)) {
+    if (!line.includes("rate_limit_event")) continue;
+    const event = parseJson(line.trim());
+    if (!event) continue;
+    if (asString(event.type, "") !== "rate_limit_event") continue;
+
+    const info = parseObject(event.rate_limit_info);
+    // Only a rejection means the run was actually blocked until the reset. An
+    // informational "allowed" / "allowed_warning" event carries a real epoch too,
+    // and honouring it would defer a run the provider never refused.
+    const rejected = [asString(info.status, ""), asString(info.overageStatus, "")]
+      .some((value) => /reject/i.test(value));
+    if (!rejected) continue;
+
+    const resetsAtRaw = asNumber(info.resetsAt, 0);
+    if (!Number.isFinite(resetsAtRaw) || resetsAtRaw <= 0) continue;
+    // Claude prints seconds; tolerate a millisecond stamp from a future CLI.
+    const resetsAt = new Date(resetsAtRaw > 1e11 ? resetsAtRaw : resetsAtRaw * 1000);
+    if (Number.isNaN(resetsAt.getTime())) continue;
+    if (resetsAt.getTime() <= now.getTime()) continue;
+    if (!latest || resetsAt.getTime() > latest.getTime()) latest = resetsAt;
+  }
+  return latest;
+}
+
 export function extractClaudeRetryNotBefore(
   input: {
     parsed?: Record<string, unknown> | null;
@@ -508,6 +543,8 @@ export function extractClaudeRetryNotBefore(
   now = new Date(),
 ): Date | null {
   const haystack = buildClaudeTransientHaystack(input);
+  const structuredResetsAt = extractClaudeRateLimitResetsAt(haystack, now);
+  if (structuredResetsAt) return structuredResetsAt;
   const match = haystack.match(CLAUDE_EXTRA_USAGE_RESET_RE);
   if (!match) return null;
   return parseClaudeResetClockTime(match[1] ?? "", now, match[2]);
