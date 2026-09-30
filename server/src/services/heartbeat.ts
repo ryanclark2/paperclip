@@ -15733,18 +15733,37 @@ export function heartbeatService(
     //
     // Scoped to this detector's own reason on purpose: an ordinary failure
     // reason belongs to the run that produced it and is still cleared when the
-    // agent leaves error. `baseStatus === "error"` is excluded for the same
-    // reason — that run failed, it keeps the agent unavailable anyway, and its
-    // own message is the more useful one to show.
+    // agent leaves error.
+    //
+    // The hold reaches a finalization landing in `error` too, and that is the
+    // whole of the ALM-9534 fix. An earlier version excluded `baseStatus ===
+    // "error"` so a failing run's own message would survive — but that branch
+    // is the one that OVERWRITES the column this condition keys on, so it
+    // destroyed the marker and the next `interrupted` or `cancelled`
+    // finalization found nothing to hold. Measured at `8aa82b276`: a tripped
+    // agent, failed exit 1, then interrupted -> `{idle, null}`, advertised
+    // healthy while still dead. Two hops, both ordinary — an agent with a
+    // broken adapter fails constantly, and a deploy interrupts every run.
+    //
+    // The cost is accepted and real: while the marker is held, the agent row
+    // shows the credential/config fault instead of the failing run's own
+    // message. That message is still on the run row and in run events, the
+    // agent is unavailable under either string, and a durable agent-level
+    // fault is the more useful thing on the agent page than one run's exit
+    // code. Composing the two strings was rejected — the marker is an equality
+    // key (`===` here, and the ALM-8037 class-B undo keys on the same bytes),
+    // so anything but the exact reason breaks the hold it exists to drive.
     const holdsFalseLivenessFault =
       !decidesFalseLiveness &&
-      baseStatus !== "error" &&
       existing.errorReason === FALSE_LIVENESS_ERROR_REASON;
 
     // `idle` advertises the agent as healthy, so a held fault keeps it in
     // `error`. `running` is left alone and only the reason is carried, which is
     // already how a tripped agent looks mid-run: the run-start write flips
-    // status to `running` without touching `errorReason`.
+    // status to `running` without touching `errorReason`. `error` needs no
+    // status change and carries the reason for the same purpose the other two
+    // do — so that the marker survives to be read by the finalization after
+    // this one.
     const nextStatus =
       falseLivenessEscalation?.status ??
       (holdsFalseLivenessFault && baseStatus === "idle" ? "error" : baseStatus);

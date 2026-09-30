@@ -613,7 +613,7 @@ describeEmbeddedPostgres("false-liveness detector writes agent status", () => {
     });
   });
 
-  it("keeps a failed run's own reason on a tripped agent", async () => {
+  it("holds the fault across a failed finalization", async () => {
     const companyId = await createCompany();
     const agentId = await createAgent(companyId, "TrippedThenFailedLoudly", {
       status: "error",
@@ -622,13 +622,119 @@ describeEmbeddedPostgres("false-liveness detector writes agent status", () => {
     });
     await seedHistory(companyId, agentId, dead(FALSE_LIVENESS_STREAK_THRESHOLD));
 
-    // The hold must not reach a finalization that is landing in `error` on its
-    // own: the agent stays unavailable either way, and this run's own message
-    // says more than the detector's. Dropping the `baseStatus !== "error"`
-    // conjunct overwrites it with the credential/config reason.
+    // Hop 1 of the ALM-9534 release, and the assertion that had to invert. At
+    // `8aa82b276` this pinned `{error, "Process exited with code 1"}` — the
+    // failing run's own message winning, on the argument that the agent stays
+    // unavailable either way. It does stay unavailable HERE. But this branch
+    // is also the only writer of the column the hold keys on, so the run's
+    // message evicted the marker and the NEXT finalization found nothing to
+    // hold. The sequence fixtures below are that next finalization.
+    //
+    // `timed_out` reaches the identical cell — it is the other outcome that
+    // resolves to a base status of `error` with a `failureReason` in hand.
+    expect(await runOnceAndReadAgent(agentId, "failed")).toEqual({
+      status: "error",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+    });
+  });
+
+  it("keeps a failed run's own reason on an agent the detector never tripped", async () => {
+    const companyId = await createCompany();
+    const agentId = await createAgent(companyId, "FailedButNeverTripped", {
+      status: "error",
+      errorReason: "Process exited with code 137",
+      exitCode: 1,
+    });
+    await seedHistory(companyId, agentId, dead(FALSE_LIVENESS_STREAK_THRESHOLD));
+
+    // One variable apart from the fixture above — the PRIOR reason — and the
+    // bound on the ALM-9534 fix. Without this, "hold the marker through a
+    // failed finalization" is indistinguishable from "a failing run never
+    // writes its own message again," which would strand every ordinary adapter
+    // failure behind whatever reason the agent happened to carry. The streak
+    // is seeded dead here too, so the streak cannot be what separates the two:
+    // the hold keys on the marker and on nothing else.
     expect(await runOnceAndReadAgent(agentId, "failed")).toEqual({
       status: "error",
       errorReason: "Process exited with code 1",
+    });
+  });
+
+  // The `failed` + `keepIdleOnFailure` arm stays uncovered: no fixture reaches
+  // a failed run that resolves to a base status of `idle`. It is structurally
+  // inside the hold — the condition no longer reads `baseStatus` at all — but
+  // that is an argument, not an example (AdversarialEng ADV-2, ALM-9534).
+
+  // And this last group runs TWO finalizations against one agent (ALM-9534).
+  // Every fixture above observes a single write, and the release they missed is
+  // invisible to all of them because it composes two individually-correct
+  // writes: at `8aa82b276` the output state of `keeps a failed run's own reason
+  // on a tripped agent` WAS the input state of `leaves an ordinary failure
+  // reason to the ordinary path`, and both were green. No single-point mutant
+  // can see that either — each half is correct on its own — which is why these
+  // are sequences rather than more probes.
+
+  it("holds the fault across a failed finalization and the interrupt that follows", async () => {
+    const companyId = await createCompany();
+    const agentId = await createAgent(companyId, "TrippedThenFailedThenDrained", {
+      status: "error",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+      exitCode: 1,
+    });
+    await seedHistory(companyId, agentId, dead(FALSE_LIVENESS_STREAK_THRESHOLD));
+
+    // Hop 1 is a failed run; hop 2 is the deploy that follows. Both are
+    // collected BEFORE either is asserted, on purpose: asserting hop 1 first
+    // aborts the example there, and then this fixture reds for the same reason
+    // the single-write one above does and never exercises the sequence at all.
+    // Asserted together, one failure shows the whole trajectory — which at
+    // `8aa82b276` is `{error, FALSE_LIVENESS}` -> `{error, "Process exited with
+    // code 1"}` -> `{idle, null}`: the agent advertised as healthy with its
+    // zero-usage streak untouched and its adapter still broken. Strictly worse
+    // than the `error` it came from. Neither hop is exotic — an agent that
+    // trips this detector fails constantly, and a graceful shutdown interrupts
+    // every in-flight run.
+    const afterFailure = await runOnceAndReadAgent(agentId, "failed");
+    const afterInterrupt = await interruptOnceAndReadAgent(companyId, agentId);
+
+    expect({ afterFailure, afterInterrupt }).toEqual({
+      afterFailure: {
+        status: "error",
+        errorReason: FALSE_LIVENESS_ERROR_REASON,
+      },
+      afterInterrupt: {
+        status: "error",
+        errorReason: FALSE_LIVENESS_ERROR_REASON,
+      },
+    });
+  });
+
+  it("holds the fault across a failed finalization and the cancel that follows", async () => {
+    const companyId = await createCompany();
+    const agentId = await createAgent(companyId, "TrippedThenFailedThenCancelled", {
+      status: "error",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+      exitCode: 1,
+    });
+    await seedHistory(companyId, agentId, dead(FALSE_LIVENESS_STREAK_THRESHOLD));
+
+    // One variable apart from the sequence above: hop 2 is a cancel. That is
+    // the second outcome reaching the same `idle` disjunct, and it arrives from
+    // ordinary scheduling — the workspace-busy deferral — rather than once per
+    // deploy, so it is the likelier of the two to fire and the one an
+    // outcome-by-outcome fix would leave open.
+    const afterFailure = await runOnceAndReadAgent(agentId, "failed");
+    const afterCancel = await cancelOnceAndReadAgent(companyId, agentId);
+
+    expect({ afterFailure, afterCancel }).toEqual({
+      afterFailure: {
+        status: "error",
+        errorReason: FALSE_LIVENESS_ERROR_REASON,
+      },
+      afterCancel: {
+        status: "error",
+        errorReason: FALSE_LIVENESS_ERROR_REASON,
+      },
     });
   });
 });

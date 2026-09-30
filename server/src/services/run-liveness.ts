@@ -548,6 +548,12 @@ export interface FalseLivenessEscalation {
    * version of this comment claimed the status was rewritten on every
    * finalization while the streak held; it was not, and an `interrupted` one
    * cleared the fault (ALM-9523).
+   *
+   * "Every other finalization" includes the ones that land in `error` on their
+   * own. Those carry no risk of advertising the agent as healthy, but they DO
+   * write `agents.errorReason`, which is the column the hold keys on — so
+   * exempting them destroyed the marker and released the fault one hop later
+   * (ALM-9534).
    */
   reportEscalation: boolean;
 }
