@@ -123,21 +123,61 @@ describeEmbeddedPostgres("false-liveness detector writes agent status", () => {
     return companyId;
   }
 
+  interface CreateAgentOptions {
+    /** Seeds the agent mid-fault. `error` is an INVOKABLE status, so a tripped
+     * agent keeps running and keeps reaching this write — that is the only
+     * reason recovery is possible at all. */
+    status?: "idle" | "error";
+    errorReason?: string;
+    /** Raised above 1 only when a fixture seeds a concurrent in-flight run:
+     * `startNextQueuedRunForAgent` gates on `maxConcurrentRuns - runningCount`,
+     * so at the default of 1 the seeded row would starve the run under test. */
+    maxConcurrentRuns?: number;
+  }
+
   /** An agent whose runs exit 0 immediately: a clean success, every time. */
-  async function createAgent(companyId: string, name: string) {
+  async function createAgent(
+    companyId: string,
+    name: string,
+    options: CreateAgentOptions = {},
+  ) {
     const agentId = randomUUID();
     await db.insert(agents).values({
       id: agentId,
       companyId,
       name,
       role: "engineer",
-      status: "idle",
+      status: options.status ?? "idle",
+      errorReason: options.errorReason ?? null,
       adapterType: "process",
       adapterConfig: { command: process.execPath, args: ["-e", "process.exit(0)"] },
-      runtimeConfig: {},
+      runtimeConfig:
+        options.maxConcurrentRuns === undefined
+          ? {}
+          : { heartbeat: { maxConcurrentRuns: options.maxConcurrentRuns } },
       permissions: {},
     });
     return agentId;
+  }
+
+  /**
+   * Another of this agent's runs, still in flight.
+   *
+   * Only the `running` status is load-bearing: `countRunningRunsForAgent`
+   * counts rows, not live processes, and that count is what drives `baseStatus`
+   * to `running` in the write under test.
+   */
+  async function seedInFlightRun(companyId: string, agentId: string) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "timer",
+      status: "running",
+      startedAt: new Date(),
+    });
+    return runId;
   }
 
   /**
@@ -190,12 +230,44 @@ describeEmbeddedPostgres("false-liveness detector writes agent status", () => {
     // terminal status. Drain before reading or this races the write under test.
     await heartbeat.drainActiveRunExecutions();
 
-    const row = await db
+    return readAgent(agentId);
+  }
+
+  async function readAgent(agentId: string) {
+    return db
       .select({ status: agents.status, errorReason: agents.errorReason })
       .from(agents)
       .where(eq(agents.id, agentId))
       .then((rows) => rows[0]!);
-    return row;
+  }
+
+  /**
+   * Interrupt one in-flight run the way a graceful shutdown does, and return
+   * the finalized agent row.
+   *
+   * Reaches `finalizeAgentStatus(..., "interrupted", ...)`, which is a real
+   * production call site and one of the two non-`succeeded` outcomes that still
+   * resolve to a base status of `idle`. Driven from a seeded row rather than a
+   * live child process on purpose: `drainRunningRunsForShutdown` selects on the
+   * `running` STATUS, and the write under test reads the agent's run history
+   * and the outcome — never a pid. Interrupting a real process here would also
+   * enqueue a process-loss retry that the dying run's own teardown promotes,
+   * which is a second run this fixture has no use for.
+   */
+  async function interruptOnceAndReadAgent(companyId: string, agentId: string) {
+    const runId = await seedInFlightRun(companyId, agentId);
+
+    const drained = await heartbeat.drainRunningRunsForShutdown(
+      "SIGTERM",
+      new Date(),
+      [runId],
+    );
+    expect(drained.interruptedRunIds).toEqual([runId]);
+    expect((await heartbeat.getRun(runId))?.status).toBe("interrupted");
+
+    await heartbeat.drainActiveRunExecutions();
+
+    return readAgent(agentId);
   }
 
   const dead = (n: number): SeedUsage[] => Array.from({ length: n }, () => ({ ...DEAD_USAGE }));
@@ -287,6 +359,87 @@ describeEmbeddedPostgres("false-liveness detector writes agent status", () => {
       ...dead(FALSE_LIVENESS_STREAK_THRESHOLD),
     ]);
 
+    expect(await runOnceAndReadAgent(agentId)).toEqual({
+      status: "error",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+    });
+  });
+
+  // The two fixtures below pin the escalation condition's two conjuncts
+  // SEPARATELY (ALM-8333 / ADR-004 Amendment 6). Every fixture above finalizes
+  // a succeeded run on an agent with nothing else in flight, so it enters the
+  // one cell where both conjuncts already hold — and either conjunct could be
+  // deleted with the suite still green.
+
+  it("leaves a concurrently-running agent alone even on a full streak", async () => {
+    const companyId = await createCompany();
+    const agentId = await createAgent(companyId, "DeadButBusy", {
+      maxConcurrentRuns: 2,
+    });
+    await seedHistory(companyId, agentId, dead(FALSE_LIVENESS_STREAK_THRESHOLD));
+    // The agent's OTHER run, still executing. Escalating now would overwrite
+    // `running` with `error` and publish a credential fault against an agent
+    // that is mid-run; the streak is durable, so the next finalization with
+    // nothing in flight catches it instead.
+    await seedInFlightRun(companyId, agentId);
+
+    expect(await runOnceAndReadAgent(agentId)).toEqual({
+      status: "running",
+      errorReason: null,
+    });
+  });
+
+  it("does not escalate when the finalizing run did not succeed", async () => {
+    const companyId = await createCompany();
+    const agentId = await createAgent(companyId, "DeadButInterrupted");
+    await seedHistory(companyId, agentId, dead(FALSE_LIVENESS_STREAK_THRESHOLD));
+
+    // `interrupted` and `cancelled` both resolve to a base status of `idle`, so
+    // the base-status conjunct alone does not exclude them. The detector's
+    // evidence is a run that CLAIMED to succeed while the provider reported
+    // nothing; a run the control plane killed makes no such claim, and reading
+    // one as proof of death would escalate on every server restart.
+    expect(await interruptOnceAndReadAgent(companyId, agentId)).toEqual({
+      status: "idle",
+      errorReason: null,
+    });
+  });
+
+  // And these two pin the recovery write, by varying the agent's PRIOR status
+  // rather than the finalizing run (ALM-8333 BLOCKING-2). Every fixture above
+  // seeds `idle`, so the transition out of the fault is never exercised.
+
+  it("clears the fault when the adapter starts reporting usage again", async () => {
+    const companyId = await createCompany();
+    const agentId = await createAgent(companyId, "TrippedThenFixed", {
+      status: "error",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+    });
+    // Credentials repaired: the newest run billed real tokens, so the streak is
+    // broken and this agent is owed its `idle` back.
+    await seedHistory(companyId, agentId, [
+      ...healthy(1),
+      ...dead(FALSE_LIVENESS_STREAK_THRESHOLD - 1),
+    ]);
+
+    expect(await runOnceAndReadAgent(agentId)).toEqual({
+      status: "idle",
+      errorReason: null,
+    });
+  });
+
+  it("keeps a tripped agent in the fault while the streak still holds", async () => {
+    const companyId = await createCompany();
+    const agentId = await createAgent(companyId, "TrippedAndStillDead", {
+      status: "error",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+    });
+    await seedHistory(companyId, agentId, dead(FALSE_LIVENESS_STREAK_THRESHOLD));
+
+    // The twin of the fixture above, and the reason it cannot be satisfied by
+    // simply never re-escalating an agent that already carries this reason:
+    // the status is rewritten on EVERY finalization while the streak holds, so
+    // a still-dead agent cannot flap back to idle and be handed more work.
     expect(await runOnceAndReadAgent(agentId)).toEqual({
       status: "error",
       errorReason: FALSE_LIVENESS_ERROR_REASON,
