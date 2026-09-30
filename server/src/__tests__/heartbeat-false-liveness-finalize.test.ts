@@ -669,10 +669,11 @@ describeEmbeddedPostgres("false-liveness detector writes agent status", () => {
   // Every fixture above observes a single write, and the release they missed is
   // invisible to all of them because it composes two individually-correct
   // writes: at `8aa82b276` the output state of `keeps a failed run's own reason
-  // on a tripped agent` WAS the input state of `leaves an ordinary failure
-  // reason to the ordinary path`, and both were green. No single-point mutant
-  // can see that either — each half is correct on its own — which is why these
-  // are sequences rather than more probes.
+  // on a tripped agent` — the fixture now named `holds the fault across a
+  // failed finalization`, back when it asserted the opposite — WAS the input
+  // state of `leaves an ordinary failure reason to the ordinary path`, and both
+  // were green. No single-point mutant can see that either, since each half is
+  // correct on its own, which is why these are sequences rather than probes.
 
   it("holds the fault across a failed finalization and the interrupt that follows", async () => {
     const companyId = await createCompany();
