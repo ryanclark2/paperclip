@@ -234,6 +234,7 @@ import {
 } from "./heartbeat-stop-metadata.js";
 import {
   classifyRunLiveness,
+  FALSE_LIVENESS_ERROR_REASON,
   FALSE_LIVENESS_SCAN_LIMIT,
   FALSE_LIVENESS_STREAK_THRESHOLD,
   resolveFalseLivenessEscalation,
@@ -15704,20 +15705,52 @@ export function heartbeatService(
     // a status written there is overwritten by the `idle` below. This is the
     // write, so it cannot be clobbered.
     //
-    // Scoped to the `idle` branch: `running` means another run is in flight and
-    // must not be stomped, and `error` is already unavailable. The streak is
-    // durable, so a run skipped for either reason is caught at the next
-    // finalization.
-    const falseLivenessEscalation =
-      baseStatus === "idle" && outcome === "succeeded"
-        ? resolveFalseLivenessEscalation(
-            await readRecentSucceededRunUsage(existing.companyId, agentId),
-            existing.errorReason,
-          )
-        : null;
-    const nextStatus = falseLivenessEscalation?.status ?? baseStatus;
+    // Only a finalization that could ENTER the fault may decide it, and that
+    // same condition governs leaving it. Both conjuncts are about evidence:
+    // `succeeded` is the detector's whole premise — a run that CLAIMED success
+    // while the provider reported nothing — and `running` means another run of
+    // this agent is in flight and must not be stomped. A finalization outside
+    // that cell is evidence of neither death nor life, exactly as a
+    // non-`succeeded` ROW is skipped by falseLivenessStreak, so it abstains.
+    const decidesFalseLiveness =
+      baseStatus === "idle" && outcome === "succeeded";
+    const falseLivenessEscalation = decidesFalseLiveness
+      ? resolveFalseLivenessEscalation(
+          await readRecentSucceededRunUsage(existing.companyId, agentId),
+          existing.errorReason,
+        )
+      : null;
+
+    // Abstaining carries an existing fault forward; it does not drop it
+    // (ALM-9523). The `errorReason` write below clears on every status that is
+    // not `error`, so recovery used to be strictly wider than escalation:
+    // measured at `cb53af60b`, a tripped agent whose streak still held was
+    // reset to `{idle, null}` by an `interrupted` or a `cancelled`
+    // finalization, and to `{running, null}` whenever another of its runs was
+    // in flight. A graceful shutdown drains every in-flight run as
+    // `interrupted`, and `error` is an invokable status, so each deploy did
+    // this to every tripped agent.
+    //
+    // Scoped to this detector's own reason on purpose: an ordinary failure
+    // reason belongs to the run that produced it and is still cleared when the
+    // agent leaves error. `baseStatus === "error"` is excluded for the same
+    // reason — that run failed, it keeps the agent unavailable anyway, and its
+    // own message is the more useful one to show.
+    const holdsFalseLivenessFault =
+      !decidesFalseLiveness &&
+      baseStatus !== "error" &&
+      existing.errorReason === FALSE_LIVENESS_ERROR_REASON;
+
+    // `idle` advertises the agent as healthy, so a held fault keeps it in
+    // `error`. `running` is left alone and only the reason is carried, which is
+    // already how a tripped agent looks mid-run: the run-start write flips
+    // status to `running` without touching `errorReason`.
+    const nextStatus =
+      falseLivenessEscalation?.status ??
+      (holdsFalseLivenessFault && baseStatus === "idle" ? "error" : baseStatus);
     const resolvedFailureReason =
-      falseLivenessEscalation?.errorReason ?? failureReason;
+      falseLivenessEscalation?.errorReason ??
+      (holdsFalseLivenessFault ? FALSE_LIVENESS_ERROR_REASON : failureReason);
 
     const updated = await db
       .update(agents)
@@ -15725,11 +15758,15 @@ export function heartbeatService(
         status: nextStatus,
         // Persist a human-readable reason on the agent record when it enters
         // error so operators see it on the agent page without digging into run
-        // events; clear it whenever the agent leaves error.
+        // events; clear it whenever the agent leaves error — unless a
+        // false-liveness fault is being held across a finalization that was
+        // never entitled to decide it.
         errorReason:
           nextStatus === "error"
             ? truncateAgentErrorReason(resolvedFailureReason)
-            : null,
+            : holdsFalseLivenessFault
+              ? FALSE_LIVENESS_ERROR_REASON
+              : null,
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })

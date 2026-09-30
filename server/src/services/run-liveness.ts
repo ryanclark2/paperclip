@@ -538,9 +538,16 @@ export interface FalseLivenessEscalation {
   status: "error";
   errorReason: string;
   /**
-   * True only on the transition into the fault. The status itself is written on
-   * every finalization while the streak holds, so a still-dead agent cannot
-   * flap back to idle, but the operator-facing report fires once per episode.
+   * True only on the transition into the fault, so the operator-facing report
+   * fires once per episode rather than on every run.
+   *
+   * Says nothing about whether the fault is durable. This function is reached
+   * only on a finalization entitled to decide the fault, and keeping a
+   * still-dead agent out of `idle` on every OTHER finalization is the caller's
+   * job — see `holdsFalseLivenessFault` in `finalizeAgentStatus`. An earlier
+   * version of this comment claimed the status was rewritten on every
+   * finalization while the streak held; it was not, and an `interrupted` one
+   * cleared the fault (ALM-9523).
    */
   reportEscalation: boolean;
 }

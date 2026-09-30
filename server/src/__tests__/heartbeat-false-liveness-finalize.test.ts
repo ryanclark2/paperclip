@@ -133,6 +133,9 @@ describeEmbeddedPostgres("false-liveness detector writes agent status", () => {
      * `startNextQueuedRunForAgent` gates on `maxConcurrentRuns - runningCount`,
      * so at the default of 1 the seeded row would starve the run under test. */
     maxConcurrentRuns?: number;
+    /** Non-zero makes the run FAIL, which is the only way to reach this write
+     * with a base status of `error` and a real `failureReason` in hand. */
+    exitCode?: number;
   }
 
   /** An agent whose runs exit 0 immediately: a clean success, every time. */
@@ -150,7 +153,10 @@ describeEmbeddedPostgres("false-liveness detector writes agent status", () => {
       status: options.status ?? "idle",
       errorReason: options.errorReason ?? null,
       adapterType: "process",
-      adapterConfig: { command: process.execPath, args: ["-e", "process.exit(0)"] },
+      adapterConfig: {
+        command: process.execPath,
+        args: ["-e", `process.exit(${options.exitCode ?? 0})`],
+      },
       runtimeConfig:
         options.maxConcurrentRuns === undefined
           ? {}
@@ -209,7 +215,10 @@ describeEmbeddedPostgres("false-liveness detector writes agent status", () => {
   }
 
   /** Run one real heartbeat to completion and return the finalized agent row. */
-  async function runOnceAndReadAgent(agentId: string) {
+  async function runOnceAndReadAgent(
+    agentId: string,
+    expectedRunStatus: "succeeded" | "failed" = "succeeded",
+  ) {
     const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     expect(queued).not.toBeNull();
 
@@ -219,7 +228,10 @@ describeEmbeddedPostgres("false-liveness detector writes agent status", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
       run = await heartbeat.getRun(queued!.id);
     }
-    expect(run?.status).toBe("succeeded");
+    // Asserted, not assumed: a fixture that means to exercise the `failed`
+    // outcome and silently gets `succeeded` would read as a passing test of the
+    // cell it was written to cover.
+    expect(run?.status).toBe(expectedRunStatus);
 
     // Load-bearing for the window arithmetic below: the run just finalized is
     // itself in the detector's window. A process agent reports no provider
@@ -264,6 +276,25 @@ describeEmbeddedPostgres("false-liveness detector writes agent status", () => {
     );
     expect(drained.interruptedRunIds).toEqual([runId]);
     expect((await heartbeat.getRun(runId))?.status).toBe("interrupted");
+
+    await heartbeat.drainActiveRunExecutions();
+
+    return readAgent(agentId);
+  }
+
+  /**
+   * Cancel one in-flight run, and return the finalized agent row.
+   *
+   * The twin of the helper above, and worth having separately: `cancelled` is
+   * the OTHER non-`succeeded` outcome that resolves to a base status of `idle`,
+   * and it reaches `finalizeAgentStatus` from different call sites than a
+   * shutdown drain does. Seeded the same way and for the same reason.
+   */
+  async function cancelOnceAndReadAgent(companyId: string, agentId: string) {
+    const runId = await seedInFlightRun(companyId, agentId);
+
+    await heartbeat.cancelRun(runId);
+    expect((await heartbeat.getRun(runId))?.status).toBe("cancelled");
 
     await heartbeat.drainActiveRunExecutions();
 
@@ -438,11 +469,146 @@ describeEmbeddedPostgres("false-liveness detector writes agent status", () => {
 
     // The twin of the fixture above, and the reason it cannot be satisfied by
     // simply never re-escalating an agent that already carries this reason:
-    // the status is rewritten on EVERY finalization while the streak holds, so
-    // a still-dead agent cannot flap back to idle and be handed more work.
+    // skipping the escalation would drop `nextStatus` back to `idle` and the
+    // reason to `null`, so re-asserting the fault IS what keeps a still-dead
+    // agent from being handed more work.
+    //
+    // This covers one finalization only — a succeeded run with nothing else in
+    // flight. Every other finalization is the group below.
     expect(await runOnceAndReadAgent(agentId)).toEqual({
       status: "error",
       errorReason: FALSE_LIVENESS_ERROR_REASON,
+    });
+  });
+
+  // And this group pins the HOLD (ALM-9523): what the write does on a
+  // finalization that is not entitled to decide the fault at all. The three
+  // fixtures above enter the one cell where the escalation runs, so the fault
+  // was re-asserted there and silently dropped everywhere else — measured at
+  // `cb53af60b`, `interrupted` and `cancelled` both reset a tripped agent to
+  // `{idle, null}` while its streak still held, and a concurrent run reset it
+  // to `{running, null}`.
+
+  it("holds the fault across an interrupted finalization", async () => {
+    const companyId = await createCompany();
+    const agentId = await createAgent(companyId, "TrippedThenInterrupted", {
+      status: "error",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+    });
+    await seedHistory(companyId, agentId, dead(FALSE_LIVENESS_STREAK_THRESHOLD));
+
+    // The production trigger, and the reason this is not a corner case: a
+    // graceful shutdown drains every in-flight run as `interrupted`, and
+    // `error` is an INVOKABLE status, so a tripped agent keeps taking runs and
+    // keeps having one in flight. Every deploy cleared every tripped agent.
+    expect(await interruptOnceAndReadAgent(companyId, agentId)).toEqual({
+      status: "error",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+    });
+  });
+
+  it("holds the fault across a cancelled finalization", async () => {
+    const companyId = await createCompany();
+    const agentId = await createAgent(companyId, "TrippedThenCancelled", {
+      status: "error",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+    });
+    await seedHistory(companyId, agentId, dead(FALSE_LIVENESS_STREAK_THRESHOLD));
+
+    // One variable apart from the fixture above. `cancelled` reaches the same
+    // `idle` disjunct of `baseStatus` by a different outcome and through
+    // different call sites, so an outcome-by-outcome fix could close one and
+    // leave the other; this pins that the condition is the evidence, not a
+    // list of outcomes.
+    expect(await cancelOnceAndReadAgent(companyId, agentId)).toEqual({
+      status: "error",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+    });
+  });
+
+  it("holds the fault while another of the agent's runs is in flight", async () => {
+    const companyId = await createCompany();
+    const agentId = await createAgent(companyId, "TrippedAndBusy", {
+      status: "error",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+      maxConcurrentRuns: 2,
+    });
+    await seedHistory(companyId, agentId, dead(FALSE_LIVENESS_STREAK_THRESHOLD));
+    await seedInFlightRun(companyId, agentId);
+
+    // One variable apart from `leaves a concurrently-running agent alone`,
+    // which seeds `idle`: here the agent is already tripped, so suppressing the
+    // escalation is not enough — the reason has to survive too. `running` with
+    // a reason set is not a novel state; it is exactly how a tripped agent
+    // looks mid-run, because the run-start write flips the status and leaves
+    // `errorReason` alone.
+    expect(await runOnceAndReadAgent(agentId)).toEqual({
+      status: "running",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+    });
+  });
+
+  it("does not clear the fault on an interrupted run that broke the streak", async () => {
+    const companyId = await createCompany();
+    const agentId = await createAgent(companyId, "TrippedThenFixedThenKilled", {
+      status: "error",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+    });
+    // Credentials repaired — the same history that DOES clear the fault in
+    // `clears the fault when the adapter starts reporting usage again`.
+    await seedHistory(companyId, agentId, [
+      ...healthy(1),
+      ...dead(FALSE_LIVENESS_STREAK_THRESHOLD - 1),
+    ]);
+
+    // Deliberate, and the one place the hold costs something: the fault
+    // outlives the repair by one run. An interrupted run is not evidence of
+    // life, so it does not get to clear the fault — and the alternative, a
+    // history read on the recovery path, would clear on evidence the
+    // escalation path refuses to act on, which is the asymmetry that caused
+    // ALM-9523 in the first place. Recovery is not deferred indefinitely:
+    // `error` is invokable, so the agent's next succeeded finalization clears
+    // it through the normal path.
+    expect(await interruptOnceAndReadAgent(companyId, agentId)).toEqual({
+      status: "error",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+    });
+  });
+
+  it("leaves an ordinary failure reason to the ordinary path", async () => {
+    const companyId = await createCompany();
+    const agentId = await createAgent(companyId, "FailedForOtherReasons", {
+      status: "error",
+      errorReason: "Process exited with code 137",
+    });
+    // A full zero-usage streak, so the only thing keeping this out of the hold
+    // is the REASON. Widening the hold to any `errorReason` reds this fixture:
+    // the agent would be pinned in `error` forever, because nothing outside the
+    // detector clears a reason it did not write.
+    await seedHistory(companyId, agentId, dead(FALSE_LIVENESS_STREAK_THRESHOLD));
+
+    expect(await interruptOnceAndReadAgent(companyId, agentId)).toEqual({
+      status: "idle",
+      errorReason: null,
+    });
+  });
+
+  it("keeps a failed run's own reason on a tripped agent", async () => {
+    const companyId = await createCompany();
+    const agentId = await createAgent(companyId, "TrippedThenFailedLoudly", {
+      status: "error",
+      errorReason: FALSE_LIVENESS_ERROR_REASON,
+      exitCode: 1,
+    });
+    await seedHistory(companyId, agentId, dead(FALSE_LIVENESS_STREAK_THRESHOLD));
+
+    // The hold must not reach a finalization that is landing in `error` on its
+    // own: the agent stays unavailable either way, and this run's own message
+    // says more than the detector's. Dropping the `baseStatus !== "error"`
+    // conjunct overwrites it with the credential/config reason.
+    expect(await runOnceAndReadAgent(agentId, "failed")).toEqual({
+      status: "error",
+      errorReason: "Process exited with code 1",
     });
   });
 });
