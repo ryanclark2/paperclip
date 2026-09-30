@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -57,6 +57,7 @@ import {
   issueService,
 } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { FALSE_LIVENESS_ERROR_REASON } from "./run-liveness.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isProspectiveBlockedTransition } from "./routable-blocked.js";
 import { evaluateAgentInvokability, type AgentOrgRow } from "./agent-invokability.js";
@@ -1904,6 +1905,35 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         }));
       }
 
+      // A held false-liveness fault is operator-visible even when the status
+      // is not `error` (ALM-9550). `finalizeAgentStatus` is not the only
+      // writer of `agents.status`: the source-resolved watchdog fold
+      // (`active-run-watchdog/adapters/postgres.ts`) and the execution-control
+      // reconciliation both write `idle` onto the row directly, without
+      // consulting the ALM-9534 hold, and neither touches `errorReason`. So a
+      // tripped agent reaches `{idle, FALSE_LIVENESS_ERROR_REASON}`: the
+      // marker survives and a status-only predicate silently loses the alert.
+      //
+      // Keyed on the reader rather than on each writer, because the writer set
+      // is the thing that grows. Measured at `f4606acb4`: 13 call sites write
+      // `agents.status`, and four can produce `{idle, marker}` — the two above
+      // plus `resumeScopeFromBudget` (`budgets.ts`) and the company-unarchive
+      // restore (`companies.ts`), which write `idle` over a `paused` row and
+      // also leave `errorReason` alone. A per-writer guard closes the two this
+      // ticket names and fails open on the other two and on the fourteenth
+      // writer; this is the only reader, so it holds for writers not yet
+      // written. The status is not worth holding on its own: `error` is an
+      // invokable status (`DIRECT_NON_INVOKABLE_STATUSES` is paused /
+      // terminated / pending_approval), so `{idle, marker}` and
+      // `{error, marker}` are identically dispatchable and this alert is the
+      // entire difference between the two rows.
+      //
+      // Equality on the exact marker bytes, never a presence test. The same
+      // fold also carries an ORDINARY reason across to
+      // `{idle, "Process exited with code 1"}`, and that reason belongs to the
+      // run, not to the agent — `isNotNull(agents.errorReason)` would alert on
+      // it. The marker is already an equality key in `finalizeAgentStatus` and
+      // in the escalation latch, so this reads it the same way those do.
       const erroredAgents = await db
         .select({
           id: agents.id,
@@ -1916,11 +1946,23 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           updatedAt: agents.updatedAt,
         })
         .from(agents)
-        .where(and(eq(agents.companyId, companyId), eq(agents.status, "error")))
+        .where(and(
+          eq(agents.companyId, companyId),
+          or(
+            eq(agents.status, "error"),
+            eq(agents.errorReason, FALSE_LIVENESS_ERROR_REASON),
+          ),
+        ))
         .orderBy(desc(agents.updatedAt), desc(agents.id));
 
       for (const agent of erroredAgents) {
         const dedupKey = `agent_error:${agent.id}`;
+        // The marker on a row that is not in `error` is the ALM-9550 case: an
+        // out-of-band writer moved the status and left the fault behind. Say
+        // that instead of "in error status", which the row contradicts.
+        const holdsFalseLivenessFault =
+          agent.status !== "error"
+          && agent.errorReason === FALSE_LIVENESS_ERROR_REASON;
         add(createItem({
           companyId,
           sourceKind: "agent_error_alert",
@@ -1934,14 +1976,18 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
             href: `/${prefix}/agents/${agent.id}`,
             metadata: { role: agent.role, errorReason: agent.errorReason },
           },
-          whyNow: "Agent is in error status and needs operator action or dismissal.",
+          whyNow: holdsFalseLivenessFault
+            ? "Agent carries an unresolved adapter credential/config fault and needs operator action or dismissal."
+            : "Agent is in error status and needs operator action or dismissal.",
           decisionVerbs: decisionVerbs(
             { id: "inspect", label: "Inspect", description: "Inspect the agent error." },
             { id: "dismiss", label: "Dismiss", description: "Dismiss this alert." },
           ),
           inlineResolvable: true,
-          entryRule: "agents.status = 'error'",
-          exitRule: "Agent leaves error status or the row is dismissed.",
+          entryRule:
+            "agents.status = 'error' OR agents.error_reason = the false-liveness marker",
+          exitRule:
+            "Agent leaves error status with the false-liveness marker cleared, or the row is dismissed.",
           dedupKey,
           severity: "high",
           activityAt: toIso(agent.updatedAt),
