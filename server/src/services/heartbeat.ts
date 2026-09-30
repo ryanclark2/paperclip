@@ -15752,21 +15752,23 @@ export function heartbeatService(
       falseLivenessEscalation?.errorReason ??
       (holdsFalseLivenessFault ? FALSE_LIVENESS_ERROR_REASON : failureReason);
 
+    // Persist a human-readable reason on the agent record when it enters error
+    // so operators see it on the agent page without digging into run events;
+    // clear it whenever the agent leaves error. The middle case is the held
+    // fault on the `running` branch: the status is not ours to write, but the
+    // reason still must not be dropped.
+    const nextErrorReason =
+      nextStatus === "error"
+        ? truncateAgentErrorReason(resolvedFailureReason)
+        : holdsFalseLivenessFault
+          ? FALSE_LIVENESS_ERROR_REASON
+          : null;
+
     const updated = await db
       .update(agents)
       .set({
         status: nextStatus,
-        // Persist a human-readable reason on the agent record when it enters
-        // error so operators see it on the agent page without digging into run
-        // events; clear it whenever the agent leaves error — unless a
-        // false-liveness fault is being held across a finalization that was
-        // never entitled to decide it.
-        errorReason:
-          nextStatus === "error"
-            ? truncateAgentErrorReason(resolvedFailureReason)
-            : holdsFalseLivenessFault
-              ? FALSE_LIVENESS_ERROR_REASON
-              : null,
+        errorReason: nextErrorReason,
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })

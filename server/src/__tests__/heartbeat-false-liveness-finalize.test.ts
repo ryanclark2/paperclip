@@ -436,6 +436,26 @@ describeEmbeddedPostgres("false-liveness detector writes agent status", () => {
     });
   });
 
+  it("does not escalate when the finalizing run was cancelled", async () => {
+    const companyId = await createCompany();
+    const agentId = await createAgent(companyId, "DeadButCancelled");
+    await seedHistory(companyId, agentId, dead(FALSE_LIVENESS_STREAK_THRESHOLD));
+
+    // The fixture above names `cancelled` and then tests only `interrupted`,
+    // which left the `cancelled` arm admitted by no fixture: widening the
+    // escalation to accept it was green (AdversarialEng A2, ALM-9520). This is
+    // the ADDITION-direction probe the removal mutants cannot reach — the
+    // condition is a disjunction, so each arm needs its own example.
+    //
+    // `cancelled` matters more than `interrupted` here: it reaches
+    // `finalizeAgentStatus` from the workspace-busy deferral path, which fires
+    // in ordinary scheduling rather than once per shutdown.
+    expect(await cancelOnceAndReadAgent(companyId, agentId)).toEqual({
+      status: "idle",
+      errorReason: null,
+    });
+  });
+
   // And these two pin the recovery write, by varying the agent's PRIOR status
   // rather than the finalizing run (ALM-8333 BLOCKING-2). Every fixture above
   // seeds `idle`, so the transition out of the fault is never exercised.
